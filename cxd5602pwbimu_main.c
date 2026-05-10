@@ -213,8 +213,9 @@ int main(int argc, FAR char *argv[])
   int total_samples = 0;
   int buffer_samples;
   int flush_threshold;
+  int report_started = 0;
   struct pollfd fds[1];
-  struct timespec start, now, delta;
+  struct timespec start, now, delta, report_prev, report_delta;
   cxd5602pwbimu_data_t *outbuf = NULL;
   FAR FILE *logfp = NULL;
 
@@ -290,6 +291,8 @@ int main(int argc, FAR char *argv[])
   memset(&now, 0, sizeof(now));
   memset(&start, 0, sizeof(start));
   memset(&delta, 0, sizeof(delta));
+  memset(&report_prev, 0, sizeof(report_prev));
+  memset(&report_delta, 0, sizeof(report_delta));
 
   while (1)
     {
@@ -331,7 +334,9 @@ int main(int argc, FAR char *argv[])
                    */
 
                   clock_gettime(CLOCK_MONOTONIC, &start);
+                  report_prev = start;
                   started = 1;
+                  report_started = 1;
                 }
 
               buffered_samples++;
@@ -358,6 +363,21 @@ int main(int argc, FAR char *argv[])
         {
           clock_gettime(CLOCK_MONOTONIC, &now);
           clock_timespec_subtract(&now, &start, &delta);
+
+          if (report_started)
+            {
+              clock_timespec_subtract(&now, &report_prev, &report_delta);
+              if (report_delta.tv_sec > 0 ||
+                  report_delta.tv_nsec >= 250000000L)
+                {
+                  printf("BUF %.1f%% (%d/%d)\n",
+                         buffered_samples * 100.0f / (float)buffer_samples,
+                         buffered_samples,
+                         buffer_samples);
+                  report_prev = now;
+                }
+            }
+
           if (delta.tv_sec >= MAX_CAPTURE_SECONDS)
             {
               break;
