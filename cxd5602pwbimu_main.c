@@ -60,6 +60,8 @@
 
 #define CXD5602PWBIMU_DEVPATH      "/dev/imu0"
 #define IMU_LOG_PATH               "/mnt/sd0/imu_log.csv"
+#define MAX_CAPTURE_SECONDS        10
+#define LOG_FLUSH_CHUNK_SAMPLES    128
 
 #define itemsof(a) (sizeof(a)/sizeof(a[0]))
 
@@ -71,14 +73,11 @@
  * Private Functions
  ****************************************************************************/
 
-static int save_sensing_data(FAR const char *path,
-                             FAR cxd5602pwbimu_data_t *first,
-                             FAR cxd5602pwbimu_data_t *last)
+static FAR FILE *open_log_file(FAR const char *path)
 {
-  FAR FILE *fp;
   struct stat st;
   int need_header = 0;
-  FAR cxd5602pwbimu_data_t *p;
+  FAR FILE *fp;
 
   if (stat(path, &st) != 0 || st.st_size == 0)
     {
@@ -89,7 +88,7 @@ static int save_sensing_data(FAR const char *path,
   if (fp == NULL)
     {
       printf("ERROR: Failed to open log file %s. %d\n", path, errno);
-      return 1;
+      return NULL;
     }
 
   if (need_header)
@@ -98,9 +97,18 @@ static int save_sensing_data(FAR const char *path,
         {
           printf("ERROR: Failed to write CSV header. %d\n", errno);
           fclose(fp);
-          return 1;
+          return NULL;
         }
     }
+
+  return fp;
+}
+
+static int append_sensing_data(FAR FILE *fp,
+                               FAR cxd5602pwbimu_data_t *first,
+                               FAR cxd5602pwbimu_data_t *last)
+{
+  FAR cxd5602pwbimu_data_t *p;
 
   for (p = first; p < last; p++)
     {
@@ -111,14 +119,13 @@ static int save_sensing_data(FAR const char *path,
                   p->ax, p->ay, p->az) < 0)
         {
           printf("ERROR: Failed to write IMU data. %d\n", errno);
-          fclose(fp);
           return 1;
         }
     }
 
-  if (fclose(fp) != 0)
+  if (fflush(fp) != 0)
     {
-      printf("ERROR: Failed to close log file %s. %d\n", path, errno);
+      printf("ERROR: Failed to flush IMU data to SD. %d\n", errno);
       return 1;
     }
 
@@ -200,11 +207,16 @@ int main(int argc, FAR char *argv[])
 {
   int fd;
   int ret;
+  int started = 0;
+  int write_failed = 0;
+  int buffered_samples = 0;
+  int total_samples = 0;
+  int buffer_samples;
+  int flush_threshold;
   struct pollfd fds[1];
   struct timespec start, now, delta;
   cxd5602pwbimu_data_t *outbuf = NULL;
-  cxd5602pwbimu_data_t *p = NULL;
-  cxd5602pwbimu_data_t *last;
+  FAR FILE *logfp = NULL;
 
   /* Sensing parameters, see start sensing function. */
 
@@ -212,6 +224,7 @@ int main(int argc, FAR char *argv[])
   const int adrange = 2;
   const int gdrange = 125;
   const int nfifos = 1;
+  const int target_buffer_samples = samplerate * MAX_CAPTURE_SECONDS;
 
   fd = open(CXD5602PWBIMU_DEVPATH, O_RDONLY);
   if (fd < 0)
@@ -220,27 +233,65 @@ int main(int argc, FAR char *argv[])
       return 1;
     }
 
-  outbuf = (cxd5602pwbimu_data_t *)malloc(sizeof(cxd5602pwbimu_data_t) * samplerate);
+  buffer_samples = target_buffer_samples;
+  while (buffer_samples >= 1)
+    {
+      outbuf = (cxd5602pwbimu_data_t *)malloc(sizeof(cxd5602pwbimu_data_t) *
+                                              buffer_samples);
+      if (outbuf != NULL)
+        {
+          break;
+        }
+
+      if (buffer_samples == 1)
+        {
+          break;
+        }
+
+      buffer_samples /= 2;
+    }
+
   if (outbuf == NULL)
     {
       printf("ERROR: Output buffer allocation failed.\n");
+      close(fd);
       return 1;
     }
-  last = outbuf + samplerate;
+
+  flush_threshold = LOG_FLUSH_CHUNK_SAMPLES;
+  if (flush_threshold > buffer_samples)
+    {
+      flush_threshold = buffer_samples;
+    }
+
+  printf("Capture buffer: %d samples (%.3f sec)\n",
+         buffer_samples, buffer_samples / (float)samplerate);
 
   fds[0].fd = fd;
   fds[0].events = POLLIN;
 
+  logfp = open_log_file(IMU_LOG_PATH);
+  if (logfp == NULL)
+    {
+      close(fd);
+      free(outbuf);
+      return 1;
+    }
+
   ret = start_sensing(fd, samplerate, adrange, gdrange, nfifos);
   if (ret)
     {
+      fclose(logfp);
       close(fd);
+      free(outbuf);
       return ret;
     }
 
   memset(&now, 0, sizeof(now));
+  memset(&start, 0, sizeof(start));
+  memset(&delta, 0, sizeof(delta));
 
-  for (p = outbuf; p < last; p++)
+  while (1)
     {
       ret = poll(fds, 1, 1000);
       if (ret < 0)
@@ -254,63 +305,104 @@ int main(int argc, FAR char *argv[])
       if (ret == 0)
         {
           printf("Timeout!\n");
-        }
-      if (p == outbuf)
-        {
-          /* To remove first sensing delay, start time measurement from
-           * the first captured data.
-           */
-
-          clock_gettime(CLOCK_MONOTONIC, &start);
+          continue;
         }
 
       if (fds[0].revents & POLLIN)
         {
-          ret = read(fd, p, sizeof(*p));
-          if (ret != sizeof(*p))
+          if (buffered_samples >= buffer_samples)
+            {
+              ret = append_sensing_data(logfp, outbuf, outbuf + buffered_samples);
+              if (ret)
+                {
+                  write_failed = 1;
+                  break;
+                }
+              buffered_samples = 0;
+            }
+
+          ret = read(fd, &outbuf[buffered_samples], sizeof(*outbuf));
+          if (ret == sizeof(*outbuf))
+            {
+              if (!started)
+                {
+                  /* To remove first sensing delay, start measurement from
+                   * the first captured data.
+                   */
+
+                  clock_gettime(CLOCK_MONOTONIC, &start);
+                  started = 1;
+                }
+
+              buffered_samples++;
+              total_samples++;
+            }
+          else
             {
               printf("ERROR: read size mismatch! %d\n", ret);
             }
         }
 
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      clock_timespec_subtract(&now, &start, &delta);
-      if (delta.tv_sec >= 1)
+      if (buffered_samples >= flush_threshold)
         {
-          break;
+          ret = append_sensing_data(logfp, outbuf, outbuf + buffered_samples);
+          if (ret)
+            {
+              write_failed = 1;
+              break;
+            }
+          buffered_samples = 0;
+        }
+
+      if (started)
+        {
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          clock_timespec_subtract(&now, &start, &delta);
+          if (delta.tv_sec >= MAX_CAPTURE_SECONDS)
+            {
+              break;
+            }
         }
     }
 
-  /* Save the latest written position */
+  if (!write_failed && buffered_samples > 0)
+    {
+      ret = append_sensing_data(logfp, outbuf, outbuf + buffered_samples);
+      if (ret)
+        {
+          write_failed = 1;
+        }
+    }
 
-  last = p;
+  if (fclose(logfp) != 0)
+    {
+      printf("ERROR: Failed to close log file %s. %d\n", IMU_LOG_PATH, errno);
+      write_failed = 1;
+    }
 
   close(fd);
 
-  ret = save_sensing_data(IMU_LOG_PATH, outbuf, last);
-  if (ret)
+  if (!write_failed)
     {
-      printf("WARNING: Failed to save samples to %s\n", IMU_LOG_PATH);
+      printf("Saved samples to %s while sampling.\n", IMU_LOG_PATH);
     }
   else
     {
-      printf("Saved samples to %s\n", IMU_LOG_PATH);
+      printf("WARNING: Failed to save all samples to %s\n", IMU_LOG_PATH);
     }
 
-  /* Output buffered sensing data */
-
-  for (p = outbuf; p < last; p++)
+  if (started)
     {
-      printf("%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
-             p->timestamp / 19200000.0f,
-             p->temp,
-             p->gx, p->gy, p->gz,
-             p->ax, p->ay, p->az);
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      clock_timespec_subtract(&now, &start, &delta);
+    }
+  else
+    {
+      memset(&delta, 0, sizeof(delta));
     }
 
-  clock_timespec_subtract(&now, &start, &delta);
   printf("Elapsed %ld.%09ld seconds\n", delta.tv_sec, delta.tv_nsec);
-  printf("%d samples captured\n", last - outbuf);
+  printf("%d samples captured\n", total_samples);
   printf("Finished.\n");
 
   free(outbuf);
