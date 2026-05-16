@@ -7,7 +7,7 @@
 
 #define IMU_RECORDER_SAMPLE_RATE_HZ  1920
 
-/* IMU デバイス、CSV、RAMバッファの状態をまとめて保持する。 */
+/* IMU デバイス、バイナリログ、RAMバッファの状態をまとめて保持する。 */
 typedef struct imu_recorder_s
 {
   int fd;
@@ -19,7 +19,7 @@ typedef struct imu_recorder_s
   int failed;
 } imu_recorder_t;
 
-/* /dev/imu0、CSV、収録バッファを準備する。 */
+/* /dev/imu0、バイナリログ、収録バッファを準備する。 */
 int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds);
 
 /* IMU のサンプリングを開始する。 */

@@ -1,13 +1,12 @@
 #include "adc_a5_recorder.h"
 
-#include "csv_file.h"
+#include "binary_file.h"
 
 #include <nuttx/config.h>
 #include <arch/cxd56xx/adc.h>
 #include <arch/cxd56xx/scu.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +14,9 @@
 #include <unistd.h>
 
 #define ADC_A5_DEVPATH           "/dev/hpadc1"
-#define ADC_A5_LOG_PATH          "/mnt/sd0/adc_a5_log.csv"
+#define ADC_A5_LOG_PATH          "/mnt/sd0/adc_a5_log.bin"
+#define ADC_A5_LOG_MAGIC         "ADCA5L1"
+#define ADC_A5_LOG_VERSION       1
 #define ADC_A5_FREQ_COEFFICIENT  7
 #define ADC_A5_READ_CHUNK_SAMPLES 128
 #define ADC_A5_REFERENCE_VOLTAGE 5.0f
@@ -34,56 +35,69 @@
 #  define ADC_A5_RAW_MAX         SHRT_MAX
 #endif
 
-/*
- * HPADC の int16_t 生値を拡張ボード A5 の電圧推定値へ変換する。
- * ここでは Spresense Arduino core の HPADC1 マッピングに合わせた線形換算を使う。
- */
-static float adc_a5_raw_to_voltage(int16_t raw)
+typedef struct adc_a5_log_header_s
 {
-  int32_t clipped = raw;
+  char magic[8];
+  uint32_t version;
+  uint32_t sample_rate_hz;
+  uint32_t record_size;
+  float reference_voltage;
+  int16_t raw_min;
+  int16_t raw_max;
+} adc_a5_log_header_t;
 
-  if (clipped < ADC_A5_RAW_MIN)
-    {
-      clipped = ADC_A5_RAW_MIN;
-    }
-  else if (clipped > ADC_A5_RAW_MAX)
-    {
-      clipped = ADC_A5_RAW_MAX;
-    }
+/*
+ * ADC A5 バイナリログの先頭ヘッダを書き込む。
+ * サンプル本体は int16_t raw の連続データで、sample_index はレコード順から復元する。
+ */
+static int adc_a5_recorder_write_header(FILE *fp)
+{
+  adc_a5_log_header_t header = {
+    ADC_A5_LOG_MAGIC,
+    ADC_A5_LOG_VERSION,
+    ADC_A5_RECORDER_SAMPLE_RATE_HZ,
+    sizeof(int16_t),
+    ADC_A5_REFERENCE_VOLTAGE,
+    ADC_A5_RAW_MIN,
+    ADC_A5_RAW_MAX
+  };
 
-  return (clipped - ADC_A5_RAW_MIN) * ADC_A5_REFERENCE_VOLTAGE /
-         (float)(ADC_A5_RAW_MAX - ADC_A5_RAW_MIN);
+  return binary_file_write(fp, &header, sizeof(header), 1, "ADC A5 binary header");
 }
 
 /*
- * RAM に蓄積した ADC A5 サンプルを CSV に書き出す。
- * sample_index はバッファ先頭の絶対サンプル番号から連番で付与する。
+ * 非ブロッキング read() で「まだ読み出せるADCデータがない」状態かを判定する。
+ * この場合は収録失敗ではなく、呼び出し元に 0 件として返す。
+ */
+static int adc_a5_is_read_empty(int err)
+{
+#ifdef EWOULDBLOCK
+  return err == EAGAIN || err == EWOULDBLOCK;
+#else
+  return err == EAGAIN;
+#endif
+}
+
+/*
+ * RAM に蓄積した ADC A5 サンプルをバイナリで書き出す。
+ * sample_index はファイル内のレコード順と sample_rate_hz から後段で復元する。
  */
 static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
 {
-  int16_t *p;
-  uint32_t sample_index = recorder->first_index;
-
   if (recorder->count == 0)
     {
       return 0;
     }
 
-  /* timestamp_sec は ADC のサンプル番号と 16kHz の固定レートから算出する。 */
-  for (p = recorder->buffer; p < recorder->buffer + recorder->count; p++)
+  /* int16_t raw を連続保存し、CSV化や電圧換算は後段の変換処理へ回す。 */
+  if (binary_file_write(recorder->fp,
+                        recorder->buffer,
+                        sizeof(recorder->buffer[0]),
+                        recorder->count,
+                        "ADC A5 samples"))
     {
-      if (fprintf(recorder->fp, "%" PRIu32 ",%.9f,%" PRId16 ",%.6f\n",
-                  sample_index,
-                  sample_index / (double)ADC_A5_RECORDER_SAMPLE_RATE_HZ,
-                  *p,
-                  adc_a5_raw_to_voltage(*p)) < 0)
-        {
-          printf("ERROR: Failed to write ADC A5 data. %d\n", errno);
-          recorder->failed = 1;
-          return 1;
-        }
-
-      sample_index++;
+      recorder->failed = 1;
+      return 1;
     }
 
   if (fflush(recorder->fp) != 0)
@@ -99,7 +113,7 @@ static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
 }
 
 /*
- * ADC A5 recorder のデバイス、出力CSV、RAMバッファを準備する。
+ * ADC A5 recorder のデバイス、出力バイナリ、RAMバッファを準備する。
  * 16kHz のサンプルを指定秒数分ためられる容量を優先し、足りなければ縮小する。
  */
 int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
@@ -115,7 +129,11 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
   recorder->total = 0;
   recorder->failed = 0;
 
-  recorder->fd = open(ADC_A5_DEVPATH, O_RDONLY);
+  /*
+   * HPADC1 は poll() 未対応の環境があるため、非ブロッキング read() で
+   * FIFO にたまった分だけ周期的に回収する。
+   */
+  recorder->fd = open(ADC_A5_DEVPATH, O_RDONLY | O_NONBLOCK);
   if (recorder->fd < 0)
     {
       printf("ERROR: Device %s open failure. %d\n", ADC_A5_DEVPATH, errno);
@@ -143,14 +161,20 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
-  recorder->fp = csv_file_open(ADC_A5_LOG_PATH,
-                               "sample_index,timestamp_sec,raw,voltage_v");
+  recorder->fp = binary_file_open(ADC_A5_LOG_PATH);
   if (recorder->fp == NULL)
     {
       recorder->failed = 1;
+      return 1;
     }
 
-  return recorder->fp == NULL ? 1 : 0;
+  if (adc_a5_recorder_write_header(recorder->fp))
+    {
+      recorder->failed = 1;
+      return 1;
+    }
+
+  return 0;
 }
 
 /*
@@ -217,8 +241,8 @@ void adc_a5_recorder_stop(adc_a5_recorder_t *recorder)
 }
 
 /*
- * poll() で読み出し可能になった ADC サンプルをまとめて取り込む。
- * ADC は 16kHz なので複数サンプルを一度に読み、RAMバッファへ詰める。
+ * ADC A5 の保留サンプルをまとめて取り込む。
+ * HPADC1 は poll() できない環境があるため、呼び出し元が非ブロッキング read() する。
  */
 int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
 {
@@ -235,6 +259,11 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
   nbytes = read(recorder->fd, readbuf, sizeof(readbuf));
   if (nbytes < 0)
     {
+      if (adc_a5_is_read_empty(errno))
+        {
+          return 0;
+        }
+
       printf("ERROR: ADC A5 read failed. %d\n", errno);
       recorder->failed = 1;
       return -1;
@@ -258,7 +287,7 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
 }
 
 /*
- * 残った ADC サンプルを書き出し、CSV、デバイス、RAMバッファを解放する。
+ * 残った ADC サンプルを書き出し、バイナリ、デバイス、RAMバッファを解放する。
  * 戻り値は保存または後始末で失敗があったかどうかを示す。
  */
 int adc_a5_recorder_finish(adc_a5_recorder_t *recorder)
@@ -283,7 +312,7 @@ int adc_a5_recorder_finish(adc_a5_recorder_t *recorder)
 
   if (!recorder->failed)
     {
-      printf("Saved ADC A5 samples to %s while sampling.\n", ADC_A5_LOG_PATH);
+      printf("Saved ADC A5 binary samples to %s.\n", ADC_A5_LOG_PATH);
     }
   else
     {

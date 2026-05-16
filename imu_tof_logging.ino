@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <arch/board/board.h>
 #include <SDHCI.h>
+#include <VL53L1X.h>
+#include <Wire.h>
 
 SDClass SD;
 
@@ -20,7 +22,7 @@ void setup(void) {
 
   if (!SD.begin())
     {
-      printf("WARNING: Failed to mount MicroSD card. IMU data save may fail.\n");
+      printf("WARNING: Failed to mount MicroSD card. Data save may fail.\n");
     }
   else
     {

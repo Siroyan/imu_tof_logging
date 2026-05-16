@@ -6,7 +6,7 @@
 
 #define ADC_A5_RECORDER_SAMPLE_RATE_HZ 16000
 
-/* ADC A5 デバイス、CSV、RAMバッファの状態をまとめて保持する。 */
+/* ADC A5 デバイス、バイナリログ、RAMバッファの状態をまとめて保持する。 */
 typedef struct adc_a5_recorder_s
 {
   int fd;
@@ -19,7 +19,7 @@ typedef struct adc_a5_recorder_s
   int failed;
 } adc_a5_recorder_t;
 
-/* /dev/hpadc1、CSV、収録バッファを準備する。 */
+/* /dev/hpadc1、バイナリログ、収録バッファを準備する。 */
 int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds);
 
 /* HPADC1/A5 のサンプリングを開始する。 */

@@ -1,6 +1,6 @@
 #include "imu_recorder.h"
 
-#include "csv_file.h"
+#include "binary_file.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -11,38 +11,60 @@
 #include <unistd.h>
 
 #define CXD5602PWBIMU_DEVPATH "/dev/imu0"
-#define IMU_LOG_PATH          "/mnt/sd0/imu_log.csv"
+#define IMU_LOG_PATH          "/mnt/sd0/imu_log.bin"
+#define IMU_LOG_MAGIC         "IMULOG1"
+#define IMU_LOG_VERSION       1
 #define IMU_ACCEL_RANGE       2
 #define IMU_GYRO_RANGE        125
 #define IMU_FIFO_THRESHOLD    1
 
+typedef struct imu_log_header_s
+{
+  char magic[8];
+  uint32_t version;
+  uint32_t sample_rate_hz;
+  uint32_t record_size;
+} imu_log_header_t;
+
 /*
- * RAM に蓄積した IMU サンプルを CSV に書き出す。
+ * IMU バイナリログの先頭ヘッダを書き込む。
+ * 後段の変換ツールが形式、サンプリングレート、1レコードサイズを判別できるようにする。
+ */
+static int imu_recorder_write_header(FILE *fp)
+{
+  imu_log_header_t header = {
+    IMU_LOG_MAGIC,
+    IMU_LOG_VERSION,
+    IMU_RECORDER_SAMPLE_RATE_HZ,
+    sizeof(cxd5602pwbimu_data_t)
+  };
+
+  return binary_file_write(fp, &header, sizeof(header), 1, "IMU binary header");
+}
+
+/*
+ * RAM に蓄積した IMU サンプルをバイナリで書き出す。
  * 収録中の SD 書き込みを極力減らすため、通常は終了処理でまとめて呼ばれる。
  */
 static int imu_recorder_flush(imu_recorder_t *recorder)
 {
-  cxd5602pwbimu_data_t *p;
-
   if (recorder->count == 0)
     {
       return 0;
     }
 
-  /* IMU timestamp は 19.2MHz カウンタなので、秒単位へ変換して保存する。 */
-  for (p = recorder->buffer; p < recorder->buffer + recorder->count; p++)
+  /*
+   * cxd5602pwbimu_data_t をそのまま連続保存する。
+   * CSV化やtimestamp秒換算は、必要に応じて後段の変換処理で行う。
+   */
+  if (binary_file_write(recorder->fp,
+                        recorder->buffer,
+                        sizeof(recorder->buffer[0]),
+                        recorder->count,
+                        "IMU samples"))
     {
-      if (fprintf(recorder->fp,
-                  "%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
-                  p->timestamp / 19200000.0f,
-                  p->temp,
-                  p->gx, p->gy, p->gz,
-                  p->ax, p->ay, p->az) < 0)
-        {
-          printf("ERROR: Failed to write IMU data. %d\n", errno);
-          recorder->failed = 1;
-          return 1;
-        }
+      recorder->failed = 1;
+      return 1;
     }
 
   if (fflush(recorder->fp) != 0)
@@ -94,7 +116,7 @@ static int imu_start_sensing(int fd)
 }
 
 /*
- * IMU recorder のデバイス、出力CSV、RAMバッファを準備する。
+ * IMU recorder のデバイス、出力バイナリ、RAMバッファを準備する。
  * バッファは指定秒数分を目標に確保し、足りない場合は半分ずつ下げて確保を試す。
  */
 int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
@@ -139,13 +161,20 @@ int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
-  recorder->fp = csv_file_open(IMU_LOG_PATH, "timestamp,temp,gx,gy,gz,ax,ay,az");
+  recorder->fp = binary_file_open(IMU_LOG_PATH);
   if (recorder->fp == NULL)
     {
       recorder->failed = 1;
+      return 1;
     }
 
-  return recorder->fp == NULL ? 1 : 0;
+  if (imu_recorder_write_header(recorder->fp))
+    {
+      recorder->failed = 1;
+      return 1;
+    }
+
+  return 0;
 }
 
 /* IMU のサンプリングを開始する。 */
@@ -165,7 +194,7 @@ void imu_recorder_stop(imu_recorder_t *recorder)
 
 /*
  * poll() で読み出し可能になった IMU サンプルを 1 件取り込む。
- * バッファが満杯の場合は CSV へ退避してから次のサンプルを格納する。
+ * バッファが満杯の場合はバイナリへ退避してから次のサンプルを格納する。
  */
 int imu_recorder_read_ready(imu_recorder_t *recorder)
 {
@@ -190,7 +219,7 @@ int imu_recorder_read_ready(imu_recorder_t *recorder)
 }
 
 /*
- * 残った IMU サンプルを書き出し、CSV、デバイス、RAMバッファを解放する。
+ * 残った IMU サンプルを書き出し、バイナリ、デバイス、RAMバッファを解放する。
  * 戻り値は保存または後始末で失敗があったかどうかを示す。
  */
 int imu_recorder_finish(imu_recorder_t *recorder)
@@ -215,7 +244,7 @@ int imu_recorder_finish(imu_recorder_t *recorder)
 
   if (!recorder->failed)
     {
-      printf("Saved samples to %s while sampling.\n", IMU_LOG_PATH);
+      printf("Saved IMU binary samples to %s.\n", IMU_LOG_PATH);
     }
   else
     {
