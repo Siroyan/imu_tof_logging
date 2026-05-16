@@ -18,6 +18,7 @@
 #define IMU_ACCEL_RANGE       2
 #define IMU_GYRO_RANGE        125
 #define IMU_FIFO_THRESHOLD    1
+#define IMU_TIMESTAMP_HZ       19200000ULL
 #define IMU_STREAM_BUFFER_SAMPLES 1024
 
 typedef struct imu_log_header_s
@@ -30,20 +31,55 @@ typedef struct imu_log_header_s
   uint64_t session_start_us;
 } imu_log_header_t;
 
-/* CLOCK_MONOTONIC から、共通収録開始時刻を原点にした経過usを作る。 */
-static uint64_t imu_recorder_session_time_us(const imu_recorder_t *recorder)
+/* CLOCK_MONOTONIC を us 単位に変換する。 */
+static uint64_t imu_recorder_monotonic_us(void)
 {
   struct timespec ts;
-  uint64_t now_us;
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-  if (now_us < recorder->session_start_us)
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+/*
+ * IMU のハードウェア timestamp 差分を us 単位へ変換する。
+ * timestamp は 32bit カウンタのため、uint32_t 差分で1周分の折り返しを吸収する。
+ */
+static uint64_t imu_recorder_timestamp_delta_us(uint32_t timestamp,
+                                                uint32_t base_timestamp)
+{
+  uint32_t delta = timestamp - base_timestamp;
+
+  return ((uint64_t)delta * 1000000ULL + IMU_TIMESTAMP_HZ / 2ULL) /
+         IMU_TIMESTAMP_HZ;
+}
+
+/*
+ * 共通収録開始時刻を原点にした IMU サンプル時刻を作る。
+ * 初回サンプルだけ CLOCK_MONOTONIC で共通時刻系へ対応付け、以降は
+ * read() した時刻ではなく IMU のハードウェア timestamp 差分から復元する。
+ */
+static uint64_t imu_recorder_session_time_us(imu_recorder_t *recorder,
+                                             uint32_t timestamp,
+                                             uint64_t read_ready_us)
+{
+  if (!recorder->timestamp_base_valid)
     {
-      return 0;
+      recorder->timestamp_base = timestamp;
+      if (read_ready_us < recorder->session_start_us)
+        {
+          recorder->timestamp_base_session_us = 0;
+        }
+      else
+        {
+          recorder->timestamp_base_session_us =
+            read_ready_us - recorder->session_start_us;
+        }
+      recorder->timestamp_base_valid = 1;
+      return recorder->timestamp_base_session_us;
     }
 
-  return now_us - recorder->session_start_us;
+  return recorder->timestamp_base_session_us +
+         imu_recorder_timestamp_delta_us(timestamp, recorder->timestamp_base);
 }
 
 /*
@@ -62,6 +98,9 @@ int imu_recorder_write_header(imu_recorder_t *recorder, uint64_t session_start_u
   };
 
   recorder->session_start_us = session_start_us;
+  recorder->timestamp_base_session_us = 0;
+  recorder->timestamp_base = 0;
+  recorder->timestamp_base_valid = 0;
   return binary_file_write(recorder->fp, &header, sizeof(header), 1,
                            "IMU binary header");
 }
@@ -117,6 +156,9 @@ int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
   recorder->capacity = IMU_STREAM_BUFFER_SAMPLES;
   recorder->total = 0;
   recorder->session_start_us = 0;
+  recorder->timestamp_base_session_us = 0;
+  recorder->timestamp_base = 0;
+  recorder->timestamp_base_valid = 0;
   recorder->failed = 0;
 
   recorder->fd = open(CXD5602PWBIMU_DEVPATH, O_RDONLY);
@@ -170,8 +212,10 @@ void imu_recorder_stop(imu_recorder_t *recorder)
 int imu_recorder_read_ready(imu_recorder_t *recorder)
 {
   int ret;
+  uint64_t read_ready_us;
   imu_sample_t sample;
 
+  read_ready_us = imu_recorder_monotonic_us();
   ret = read(recorder->fd, &sample.data, sizeof(sample.data));
   if (ret != sizeof(sample.data))
     {
@@ -179,7 +223,10 @@ int imu_recorder_read_ready(imu_recorder_t *recorder)
       return 0;
     }
 
-  sample.session_time_us = imu_recorder_session_time_us(recorder);
+  sample.session_time_us =
+    imu_recorder_session_time_us(recorder,
+                                 sample.data.timestamp,
+                                 read_ready_us);
   if (binary_stream_append(&recorder->stream, &sample))
     {
       recorder->failed = 1;
