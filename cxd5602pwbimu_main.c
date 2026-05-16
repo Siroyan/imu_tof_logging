@@ -51,7 +51,10 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
+#include <arch/cxd56xx/adc.h>
+#include <arch/cxd56xx/scu.h>
 #include <nuttx/sensors/cxd5602pwbimu.h>
 
 /****************************************************************************
@@ -59,9 +62,30 @@
  ****************************************************************************/
 
 #define CXD5602PWBIMU_DEVPATH      "/dev/imu0"
+#define ADC_A5_DEVPATH             "/dev/hpadc1"
 #define IMU_LOG_PATH               "/mnt/sd0/imu_log.csv"
+#define ADC_A5_LOG_PATH            "/mnt/sd0/adc_a5_log.csv"
 #define MAX_CAPTURE_SECONDS        10
 #define LOG_FLUSH_CHUNK_SAMPLES    128
+#define ADC_A5_SAMPLE_RATE_HZ      16000
+#define ADC_A5_FREQ_COEFFICIENT    7
+#define ADC_LOG_FLUSH_CHUNK_SAMPLES 1024
+#define ADC_READ_CHUNK_SAMPLES     128
+#define ADC_A5_REFERENCE_VOLTAGE   5.0f
+
+#ifdef CONFIG_CXD56_HPADC1_FSIZE
+#  define ADC_A5_FIFO_SIZE         CONFIG_CXD56_HPADC1_FSIZE
+#else
+#  define ADC_A5_FIFO_SIZE         64
+#endif
+
+#ifdef CONFIG_CXD56_HPADC1_INPUT_GAIN_M6DB
+#  define ADC_A5_RAW_MIN           (-29362)
+#  define ADC_A5_RAW_MAX           (26375)
+#else
+#  define ADC_A5_RAW_MIN           SHRT_MIN
+#  define ADC_A5_RAW_MAX           SHRT_MAX
+#endif
 
 #define itemsof(a) (sizeof(a)/sizeof(a[0]))
 
@@ -69,11 +93,18 @@
  * Private values
  ****************************************************************************/
 
+typedef struct adc_a5_record_s
+{
+  uint32_t sample_index;
+  int16_t raw;
+} adc_a5_record_t;
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
 
-static FAR FILE *open_log_file(FAR const char *path)
+static FAR FILE *open_log_file(FAR const char *path,
+                               FAR const char *header)
 {
   struct stat st;
   int need_header = 0;
@@ -93,7 +124,7 @@ static FAR FILE *open_log_file(FAR const char *path)
 
   if (need_header)
     {
-      if (fprintf(fp, "timestamp,temp,gx,gy,gz,ax,ay,az\n") < 0)
+      if (fprintf(fp, "%s\n", header) < 0)
         {
           printf("ERROR: Failed to write CSV header. %d\n", errno);
           fclose(fp);
@@ -102,6 +133,23 @@ static FAR FILE *open_log_file(FAR const char *path)
     }
 
   return fp;
+}
+
+static float adc_a5_raw_to_voltage(int16_t raw)
+{
+  int32_t clipped = raw;
+
+  if (clipped < ADC_A5_RAW_MIN)
+    {
+      clipped = ADC_A5_RAW_MIN;
+    }
+  else if (clipped > ADC_A5_RAW_MAX)
+    {
+      clipped = ADC_A5_RAW_MAX;
+    }
+
+  return (clipped - ADC_A5_RAW_MIN) * ADC_A5_REFERENCE_VOLTAGE /
+         (float)(ADC_A5_RAW_MAX - ADC_A5_RAW_MIN);
 }
 
 static int append_sensing_data(FAR FILE *fp,
@@ -126,6 +174,34 @@ static int append_sensing_data(FAR FILE *fp,
   if (fflush(fp) != 0)
     {
       printf("ERROR: Failed to flush IMU data to SD. %d\n", errno);
+      return 1;
+    }
+
+  return 0;
+}
+
+static int append_adc_a5_data(FAR FILE *fp,
+                              FAR adc_a5_record_t *first,
+                              FAR adc_a5_record_t *last)
+{
+  FAR adc_a5_record_t *p;
+
+  for (p = first; p < last; p++)
+    {
+      if (fprintf(fp, "%" PRIu32 ",%.9f,%" PRId16 ",%.6f\n",
+                  p->sample_index,
+                  p->sample_index / (double)ADC_A5_SAMPLE_RATE_HZ,
+                  p->raw,
+                  adc_a5_raw_to_voltage(p->raw)) < 0)
+        {
+          printf("ERROR: Failed to write ADC A5 data. %d\n", errno);
+          return 1;
+        }
+    }
+
+  if (fflush(fp) != 0)
+    {
+      printf("ERROR: Failed to flush ADC A5 data to SD. %d\n", errno);
       return 1;
     }
 
@@ -195,6 +271,44 @@ static int start_sensing(int fd, int rate, int adrange, int gdrange,
   return 0;
 }
 
+static int start_adc_a5(int fd)
+{
+  int ret;
+
+  ret = ioctl(fd, SCUIOC_SETFIFOMODE, 1);
+  if (ret < 0)
+    {
+      printf("ERROR: Failed to set ADC A5 FIFO overwrite mode. %d\n", errno);
+      return 1;
+    }
+
+  ret = ioctl(fd, ANIOC_CXD56_FIFOSIZE, ADC_A5_FIFO_SIZE);
+  if (ret < 0)
+    {
+      printf("ERROR: Failed to set ADC A5 FIFO size. %d\n", errno);
+      return 1;
+    }
+
+  ret = ioctl(fd, ANIOC_CXD56_FREQ, ADC_A5_FREQ_COEFFICIENT);
+  if (ret < 0)
+    {
+      printf("ERROR: Failed to set ADC A5 sampling coefficient. %d\n", errno);
+      return 1;
+    }
+
+  ret = ioctl(fd, ANIOC_CXD56_START, 0);
+  if (ret < 0)
+    {
+      printf("ERROR: Failed to start ADC A5 sampling. %d\n", errno);
+      return 1;
+    }
+
+  printf("ADC A5 init: OK (%s, HPADC1, %d Hz)\n",
+         ADC_A5_DEVPATH, ADC_A5_SAMPLE_RATE_HZ);
+
+  return 0;
+}
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -206,18 +320,30 @@ static int start_sensing(int fd, int rate, int adrange, int gdrange,
 int main(int argc, FAR char *argv[])
 {
   int fd;
+  int adcfd;
   int ret;
   int started = 0;
   int write_failed = 0;
+  int adc_failed = 0;
   int buffered_samples = 0;
+  int buffered_adc_samples = 0;
   int total_samples = 0;
+  uint32_t total_adc_samples = 0;
   int buffer_samples;
+  int adc_buffer_samples;
   int flush_threshold;
+  int adc_flush_threshold;
   int report_started = 0;
-  struct pollfd fds[1];
+  int adc_samples_read;
+  int i;
+  ssize_t adc_nbytes;
+  int16_t adc_readbuf[ADC_READ_CHUNK_SAMPLES];
+  struct pollfd fds[2];
   struct timespec start, now, delta, report_prev, report_delta;
   cxd5602pwbimu_data_t *outbuf = NULL;
+  adc_a5_record_t *adcoutbuf = NULL;
   FAR FILE *logfp = NULL;
+  FAR FILE *adclogfp = NULL;
 
   /* Sensing parameters, see start sensing function. */
 
@@ -226,11 +352,20 @@ int main(int argc, FAR char *argv[])
   const int gdrange = 125;
   const int nfifos = 1;
   const int target_buffer_samples = samplerate * MAX_CAPTURE_SECONDS;
+  const int target_adc_buffer_samples = ADC_A5_SAMPLE_RATE_HZ;
 
   fd = open(CXD5602PWBIMU_DEVPATH, O_RDONLY);
   if (fd < 0)
     {
       printf("ERROR: Device %s open failure. %d\n", CXD5602PWBIMU_DEVPATH, errno);
+      return 1;
+    }
+
+  adcfd = open(ADC_A5_DEVPATH, O_RDONLY);
+  if (adcfd < 0)
+    {
+      printf("ERROR: Device %s open failure. %d\n", ADC_A5_DEVPATH, errno);
+      close(fd);
       return 1;
     }
 
@@ -256,6 +391,34 @@ int main(int argc, FAR char *argv[])
     {
       printf("ERROR: Output buffer allocation failed.\n");
       close(fd);
+      close(adcfd);
+      return 1;
+    }
+
+  adc_buffer_samples = target_adc_buffer_samples;
+  while (adc_buffer_samples >= 1)
+    {
+      adcoutbuf = (adc_a5_record_t *)malloc(sizeof(adc_a5_record_t) *
+                                            adc_buffer_samples);
+      if (adcoutbuf != NULL)
+        {
+          break;
+        }
+
+      if (adc_buffer_samples == 1)
+        {
+          break;
+        }
+
+      adc_buffer_samples /= 2;
+    }
+
+  if (adcoutbuf == NULL)
+    {
+      printf("ERROR: ADC A5 output buffer allocation failed.\n");
+      close(fd);
+      close(adcfd);
+      free(outbuf);
       return 1;
     }
 
@@ -265,26 +428,67 @@ int main(int argc, FAR char *argv[])
       flush_threshold = buffer_samples;
     }
 
+  adc_flush_threshold = ADC_LOG_FLUSH_CHUNK_SAMPLES;
+  if (adc_flush_threshold > adc_buffer_samples)
+    {
+      adc_flush_threshold = adc_buffer_samples;
+    }
+
   printf("Capture buffer: %d samples (%.3f sec)\n",
          buffer_samples, buffer_samples / (float)samplerate);
+  printf("ADC A5 buffer: %d samples (%.3f sec)\n",
+         adc_buffer_samples,
+         adc_buffer_samples / (float)ADC_A5_SAMPLE_RATE_HZ);
 
   fds[0].fd = fd;
   fds[0].events = POLLIN;
+  fds[1].fd = adcfd;
+  fds[1].events = POLLIN;
 
-  logfp = open_log_file(IMU_LOG_PATH);
+  logfp = open_log_file(IMU_LOG_PATH, "timestamp,temp,gx,gy,gz,ax,ay,az");
   if (logfp == NULL)
     {
       close(fd);
+      close(adcfd);
       free(outbuf);
+      free(adcoutbuf);
       return 1;
+    }
+
+  adclogfp = open_log_file(ADC_A5_LOG_PATH,
+                           "sample_index,timestamp_sec,raw,voltage_v");
+  if (adclogfp == NULL)
+    {
+      fclose(logfp);
+      close(fd);
+      close(adcfd);
+      free(outbuf);
+      free(adcoutbuf);
+      return 1;
+    }
+
+  ret = start_adc_a5(adcfd);
+  if (ret)
+    {
+      fclose(adclogfp);
+      fclose(logfp);
+      close(fd);
+      close(adcfd);
+      free(outbuf);
+      free(adcoutbuf);
+      return ret;
     }
 
   ret = start_sensing(fd, samplerate, adrange, gdrange, nfifos);
   if (ret)
     {
+      ioctl(adcfd, ANIOC_CXD56_STOP, 0);
+      fclose(adclogfp);
       fclose(logfp);
       close(fd);
+      close(adcfd);
       free(outbuf);
+      free(adcoutbuf);
       return ret;
     }
 
@@ -296,7 +500,7 @@ int main(int argc, FAR char *argv[])
 
   while (1)
     {
-      ret = poll(fds, 1, 1000);
+      ret = poll(fds, 2, 1000);
       if (ret < 0)
         {
           if (errno != EINTR)
@@ -309,6 +513,58 @@ int main(int argc, FAR char *argv[])
         {
           printf("Timeout!\n");
           continue;
+        }
+
+      if (fds[1].revents & POLLIN)
+        {
+          if (buffered_adc_samples >= adc_buffer_samples)
+            {
+              ret = append_adc_a5_data(adclogfp,
+                                       adcoutbuf,
+                                       adcoutbuf + buffered_adc_samples);
+              if (ret)
+                {
+                  adc_failed = 1;
+                  break;
+                }
+              buffered_adc_samples = 0;
+            }
+
+          adc_nbytes = read(adcfd, adc_readbuf, sizeof(adc_readbuf));
+          if (adc_nbytes < 0)
+            {
+              printf("ERROR: ADC A5 read failed. %d\n", errno);
+              adc_failed = 1;
+              break;
+            }
+
+          adc_samples_read = adc_nbytes / sizeof(adc_readbuf[0]);
+          for (i = 0; i < adc_samples_read; i++)
+            {
+              if (buffered_adc_samples >= adc_buffer_samples)
+                {
+                  ret = append_adc_a5_data(adclogfp,
+                                           adcoutbuf,
+                                           adcoutbuf + buffered_adc_samples);
+                  if (ret)
+                    {
+                      adc_failed = 1;
+                      break;
+                    }
+                  buffered_adc_samples = 0;
+                }
+
+              adcoutbuf[buffered_adc_samples].sample_index =
+                total_adc_samples;
+              adcoutbuf[buffered_adc_samples].raw = adc_readbuf[i];
+              buffered_adc_samples++;
+              total_adc_samples++;
+            }
+
+          if (adc_failed)
+            {
+              break;
+            }
         }
 
       if (fds[0].revents & POLLIN)
@@ -348,6 +604,19 @@ int main(int argc, FAR char *argv[])
             }
         }
 
+      if (buffered_adc_samples >= adc_flush_threshold)
+        {
+          ret = append_adc_a5_data(adclogfp,
+                                   adcoutbuf,
+                                   adcoutbuf + buffered_adc_samples);
+          if (ret)
+            {
+              adc_failed = 1;
+              break;
+            }
+          buffered_adc_samples = 0;
+        }
+
       if (buffered_samples >= flush_threshold)
         {
           ret = append_sensing_data(logfp, outbuf, outbuf + buffered_samples);
@@ -385,6 +654,17 @@ int main(int argc, FAR char *argv[])
         }
     }
 
+  if (!adc_failed && buffered_adc_samples > 0)
+    {
+      ret = append_adc_a5_data(adclogfp,
+                               adcoutbuf,
+                               adcoutbuf + buffered_adc_samples);
+      if (ret)
+        {
+          adc_failed = 1;
+        }
+    }
+
   if (!write_failed && buffered_samples > 0)
     {
       ret = append_sensing_data(logfp, outbuf, outbuf + buffered_samples);
@@ -394,6 +674,17 @@ int main(int argc, FAR char *argv[])
         }
     }
 
+  if (ioctl(adcfd, ANIOC_CXD56_STOP, 0) < 0)
+    {
+      printf("WARNING: Failed to stop ADC A5 sampling. %d\n", errno);
+    }
+
+  if (fclose(adclogfp) != 0)
+    {
+      printf("ERROR: Failed to close log file %s. %d\n", ADC_A5_LOG_PATH, errno);
+      adc_failed = 1;
+    }
+
   if (fclose(logfp) != 0)
     {
       printf("ERROR: Failed to close log file %s. %d\n", IMU_LOG_PATH, errno);
@@ -401,6 +692,7 @@ int main(int argc, FAR char *argv[])
     }
 
   close(fd);
+  close(adcfd);
 
   if (!write_failed)
     {
@@ -409,6 +701,15 @@ int main(int argc, FAR char *argv[])
   else
     {
       printf("WARNING: Failed to save all samples to %s\n", IMU_LOG_PATH);
+    }
+
+  if (!adc_failed)
+    {
+      printf("Saved ADC A5 samples to %s while sampling.\n", ADC_A5_LOG_PATH);
+    }
+  else
+    {
+      printf("WARNING: Failed to save all samples to %s\n", ADC_A5_LOG_PATH);
     }
 
   if (started)
@@ -423,9 +724,11 @@ int main(int argc, FAR char *argv[])
 
   printf("Elapsed %ld.%09ld seconds\n", delta.tv_sec, delta.tv_nsec);
   printf("%d samples captured\n", total_samples);
+  printf("%" PRIu32 " ADC A5 samples captured\n", total_adc_samples);
   printf("Finished.\n");
 
   free(outbuf);
+  free(adcoutbuf);
 
-  return 0;
+  return (write_failed || adc_failed) ? 1 : 0;
 }
