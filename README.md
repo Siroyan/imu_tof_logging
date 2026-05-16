@@ -13,7 +13,7 @@ A5 は Spresense Arduino core の割り当てに合わせて HPADC1 (`/dev/hpadc
 
 | ファイル | 役割 |
 | --- | --- |
-| `imu_tof_logging.ino` | Arduino スケッチ本体。CXD5602PWBIMU と MicroSD を初期化し、C 側の `main(0, NULL)` を呼び出します。 |
+| `imu_tof_logging.ino` | Arduino スケッチ本体。CXD5602PWBIMU と MicroSD を初期化し、Digital2 の開始トリガを待ってから C 側の `main(0, NULL)` を呼び出します。 |
 | `app_main.c` | C 側エントリポイント。`capture_session_run()` を呼び出します。 |
 | `capture_session.c` / `capture_session.h` | IMU、ToF、ADC A5 の起動、poll ループ、収録時間管理、終了処理をまとめる収録制御層です。 |
 | `imu_recorder.c` / `imu_recorder.h` | `/dev/imu0` の設定、読み出し、IMU バイナリログへの保存を担当します。 |
@@ -65,7 +65,10 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 
 ## 現在の固定設定
 
-- 収録時間: `10` 秒
+- 収録開始トリガ: 拡張ボード Digital2 が `LOW` で待機した後に `HIGH`
+- トリガ入力ピン定義: `PIN_D02`
+- トリガ安定待ち: `50` ms
+- 収録時間: `30` 秒
 - IMU サンプリングレート: `1920` Hz
 - IMU 加速度レンジ: `2`
 - IMU ジャイロレンジ: `125`
@@ -78,7 +81,7 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 - ADC デバイス: `/dev/hpadc1`
 - ADC サンプリングレート: `16` kHz
 - ADC 周波数係数: `7`
-- IMU 2面バッファ: `1024` samples/面
+- IMU 2面バッファ: `2048` samples/面
 - ToF 2面バッファ: `64` samples/面
 - ADC A5 2面バッファ: `8192` samples/面
 
@@ -95,6 +98,7 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 - Sony Spresense Arduino 環境
 - CXD5602PWBIMU が `/dev/imu0` として使える環境
 - MicroSD カードが `/mnt/sd0` にマウントされる環境
+- 拡張ボード Digital2 へ開始前 `LOW`、開始時 `HIGH` の信号を入力できる環境
 - VL53L1X センサが I2C0 のアドレス `0x29` で応答する環境
 - VL53L1X Arduino ライブラリ
 - HPADC1 が有効な Spresense SDK/Arduino core 設定
@@ -102,6 +106,10 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 ## 注意点
 
 - バイナリログは収録開始時に上書きされます。過去ログを残す場合は、実行前に別名へ退避してください。
+- 起動後、Digital2 が `LOW` で50ms安定するまで開始待機状態には入りません。
+  その後、Digital2 が `HIGH` で50ms安定したら収録を開始します。
+- Spresense拡張ボードのデジタル端子は未接続時に `HIGH` になり得ます。
+  外部回路側で収録前は明確に `LOW`、開始時は明確に `HIGH` を与えてください。
 - 収録中のSD書き込みは2面バッファと書き込みスレッドで行います。
   SD書き込みが追いつかず2面とも埋まった場合は、サンプル欠落を避けるため
   エラーとして収録を止めます。

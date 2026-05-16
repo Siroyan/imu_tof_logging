@@ -17,7 +17,6 @@
 #define TOF_LOG_VERSION          2
 #define TOF_I2C_ADDRESS          0x29
 #define TOF_I2C_CLOCK_HZ         400000
-#define TOF_WIRE_TIMEOUT_US      100000
 #define TOF_SENSOR_TIMEOUT_MS    100
 #define TOF_TIMING_BUDGET_US     50000
 #define TOF_CHECK_INTERVAL_US    5000
@@ -125,7 +124,6 @@ int tof_recorder_start(tof_recorder_t *recorder)
 {
   Wire.begin();
   Wire.setClock(TOF_I2C_CLOCK_HZ);
-  Wire.setWireTimeout(TOF_WIRE_TIMEOUT_US, true);
 
   g_tof_sensor.setBus(&Wire);
   g_tof_sensor.setTimeout(TOF_SENSOR_TIMEOUT_MS);
