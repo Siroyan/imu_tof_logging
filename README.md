@@ -34,6 +34,9 @@ A5 は Spresense Arduino core の割り当てに合わせて HPADC1 (`/dev/hpadc
 | レコード | `session_time_us` と `cxd5602pwbimu_data_t` を `record_size` バイトずつ連続保存します。 |
 
 `session_time_us` は全センサ共通の収録開始時刻からの経過時間です。
+初回IMUサンプルを `CLOCK_MONOTONIC` の共通時刻系へ対応付けた後、
+以降のIMUサンプルは読み出し時刻ではなくIMUハードウェア timestamp の差分から
+`session_time_us` を復元して保存します。
 IMU timestamp の秒換算は、後段の変換処理で `timestamp / 19200000.0`
 として行います。
 

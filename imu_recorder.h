@@ -25,6 +25,9 @@ typedef struct imu_recorder_s
   int capacity;
   int total;
   uint64_t session_start_us;
+  uint64_t timestamp_base_session_us;
+  uint32_t timestamp_base;
+  int timestamp_base_valid;
   int failed;
 } imu_recorder_t;
 
