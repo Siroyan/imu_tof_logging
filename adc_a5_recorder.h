@@ -1,6 +1,8 @@
 #ifndef ADC_A5_RECORDER_H
 #define ADC_A5_RECORDER_H
 
+#include "binary_stream.h"
+
 #include <stdint.h>
 #include <stdio.h>
 
@@ -11,10 +13,8 @@ typedef struct adc_a5_recorder_s
 {
   int fd;
   FILE *fp;
-  int16_t *buffer;
+  binary_stream_t stream;
   int capacity;
-  int count;
-  uint32_t first_index;
   uint32_t total;
   uint64_t session_start_us;
   int failed;

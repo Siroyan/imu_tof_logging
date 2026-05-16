@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -20,6 +20,7 @@
 #define ADC_A5_FREQ_COEFFICIENT  7
 #define ADC_A5_READ_CHUNK_SAMPLES 128
 #define ADC_A5_REFERENCE_VOLTAGE 5.0f
+#define ADC_A5_STREAM_BUFFER_SAMPLES 8192
 
 #ifdef CONFIG_CXD56_HPADC1_FSIZE
 #  define ADC_A5_FIFO_SIZE       CONFIG_CXD56_HPADC1_FSIZE
@@ -90,53 +91,17 @@ static int adc_a5_is_read_empty(int err)
 }
 
 /*
- * RAM に蓄積した ADC A5 サンプルをバイナリで書き出す。
- * sample_index はファイル内のレコード順と sample_rate_hz から後段で復元する。
- */
-static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
-{
-  if (recorder->count == 0)
-    {
-      return 0;
-    }
-
-  /* int16_t raw を連続保存し、CSV化や電圧換算は後段の変換処理へ回す。 */
-  if (binary_file_write(recorder->fp,
-                        recorder->buffer,
-                        sizeof(recorder->buffer[0]),
-                        recorder->count,
-                        "ADC A5 samples"))
-    {
-      recorder->failed = 1;
-      return 1;
-    }
-
-  if (fflush(recorder->fp) != 0)
-    {
-      printf("ERROR: Failed to flush ADC A5 data to SD. %d\n", errno);
-      recorder->failed = 1;
-      return 1;
-    }
-
-  recorder->first_index += recorder->count;
-  recorder->count = 0;
-  return 0;
-}
-
-/*
  * ADC A5 recorder のデバイス、出力バイナリ、RAMバッファを準備する。
- * 16kHz のサンプルを指定秒数分ためられる容量を優先し、足りなければ縮小する。
+ * 16kHz のサンプルを2面バッファで受け、SD書き込みは別スレッドに任せる。
  */
 int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
 {
-  int target_samples;
+  (void)capture_seconds;
 
   recorder->fd = -1;
   recorder->fp = NULL;
-  recorder->buffer = NULL;
-  recorder->capacity = 0;
-  recorder->count = 0;
-  recorder->first_index = 0;
+  memset(&recorder->stream, 0, sizeof(recorder->stream));
+  recorder->capacity = ADC_A5_STREAM_BUFFER_SAMPLES;
   recorder->total = 0;
   recorder->session_start_us = 0;
   recorder->failed = 0;
@@ -153,28 +118,18 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
-  /* 収録中のSD書き込みを避けるため、まず収録全体分のRAM確保を試みる。 */
-  target_samples = ADC_A5_RECORDER_SAMPLE_RATE_HZ * capture_seconds;
-  for (recorder->capacity = target_samples;
-       recorder->capacity >= 1;
-       recorder->capacity /= 2)
+  recorder->fp = binary_file_open(ADC_A5_LOG_PATH);
+  if (recorder->fp == NULL)
     {
-      recorder->buffer = (int16_t *)malloc(sizeof(int16_t) * recorder->capacity);
-      if (recorder->buffer != NULL)
-        {
-          break;
-        }
-    }
-
-  if (recorder->buffer == NULL)
-    {
-      printf("ERROR: ADC A5 output buffer allocation failed.\n");
       recorder->failed = 1;
       return 1;
     }
 
-  recorder->fp = binary_file_open(ADC_A5_LOG_PATH);
-  if (recorder->fp == NULL)
+  if (binary_stream_open(&recorder->stream,
+                         recorder->fp,
+                         sizeof(int16_t),
+                         recorder->capacity,
+                         "ADC A5 samples"))
     {
       recorder->failed = 1;
       return 1;
@@ -257,11 +212,6 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
   int16_t readbuf[ADC_A5_READ_CHUNK_SAMPLES];
   ssize_t nbytes;
 
-  if (recorder->count >= recorder->capacity && adc_a5_recorder_flush(recorder))
-    {
-      return -1;
-    }
-
   nbytes = read(recorder->fd, readbuf, sizeof(readbuf));
   if (nbytes < 0)
     {
@@ -279,13 +229,12 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
   samples_read = nbytes / sizeof(readbuf[0]);
   for (i = 0; i < samples_read; i++)
     {
-      if (recorder->count >= recorder->capacity && adc_a5_recorder_flush(recorder))
+      if (binary_stream_append(&recorder->stream, &readbuf[i]))
         {
+          recorder->failed = 1;
           return -1;
         }
 
-      recorder->buffer[recorder->count] = readbuf[i];
-      recorder->count++;
       recorder->total++;
     }
 
@@ -298,9 +247,9 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
  */
 int adc_a5_recorder_finish(adc_a5_recorder_t *recorder)
 {
-  if (!recorder->failed && recorder->fp != NULL && recorder->count > 0)
+  if (recorder->fp != NULL && binary_stream_close(&recorder->stream))
     {
-      adc_a5_recorder_flush(recorder);
+      recorder->failed = 1;
     }
 
   if (recorder->fp != NULL && fclose(recorder->fp) != 0)
@@ -313,8 +262,6 @@ int adc_a5_recorder_finish(adc_a5_recorder_t *recorder)
     {
       close(recorder->fd);
     }
-
-  free(recorder->buffer);
 
   if (!recorder->failed)
     {

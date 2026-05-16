@@ -1,6 +1,8 @@
 #ifndef TOF_RECORDER_H
 #define TOF_RECORDER_H
 
+#include "binary_stream.h"
+
 #include <stdint.h>
 #include <stdio.h>
 
@@ -20,9 +22,8 @@ typedef struct tof_sample_s
 typedef struct tof_recorder_s
 {
   FILE *fp;
-  tof_sample_t *buffer;
+  binary_stream_t stream;
   int capacity;
-  int count;
   uint32_t total;
   uint64_t next_check_us;
   uint64_t session_start_us;

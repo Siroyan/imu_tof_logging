@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define TOF_LOG_PATH             "/mnt/sd0/tof_log.bin"
@@ -21,6 +21,7 @@
 #define TOF_SENSOR_TIMEOUT_MS    100
 #define TOF_TIMING_BUDGET_US     50000
 #define TOF_CHECK_INTERVAL_US    5000
+#define TOF_STREAM_BUFFER_SAMPLES 64
 
 typedef struct tof_log_header_s
 {
@@ -80,77 +81,34 @@ int tof_recorder_write_header(tof_recorder_t *recorder, uint64_t session_start_u
 }
 
 /*
- * RAM に蓄積した ToF 測距結果をバイナリで書き出す。
- * タイムスタンプと距離値を固定長レコードとして保存し、後段でCSV化できるようにする。
- */
-static int tof_recorder_flush(tof_recorder_t *recorder)
-{
-  if (recorder->count == 0)
-    {
-      return 0;
-    }
-
-  if (binary_file_write(recorder->fp,
-                        recorder->buffer,
-                        sizeof(recorder->buffer[0]),
-                        recorder->count,
-                        "ToF samples"))
-    {
-      recorder->failed = 1;
-      return 1;
-    }
-
-  if (fflush(recorder->fp) != 0)
-    {
-      printf("ERROR: Failed to flush ToF data to SD. %d\n", errno);
-      recorder->failed = 1;
-      return 1;
-    }
-
-  recorder->count = 0;
-  return 0;
-}
-
-/*
  * ToF recorder の出力バイナリとRAMバッファを準備する。
- * VL53L1X は低レートなので、指定秒数分のバッファを確保しやすい。
+ * VL53L1X は低レートなので、小さな2面バッファでSD書き込みを分離する。
  */
 int tof_recorder_open(tof_recorder_t *recorder, int capture_seconds)
 {
-  int target_samples;
+  (void)capture_seconds;
 
   recorder->fp = NULL;
-  recorder->buffer = NULL;
-  recorder->capacity = 0;
-  recorder->count = 0;
+  memset(&recorder->stream, 0, sizeof(recorder->stream));
+  recorder->capacity = TOF_STREAM_BUFFER_SAMPLES;
   recorder->total = 0;
   recorder->next_check_us = 0;
   recorder->session_start_us = 0;
   recorder->failed = 0;
   recorder->started = 0;
 
-  target_samples = TOF_RECORDER_SAMPLE_RATE_HZ * capture_seconds;
-  for (recorder->capacity = target_samples;
-       recorder->capacity >= 1;
-       recorder->capacity /= 2)
+  recorder->fp = binary_file_open(TOF_LOG_PATH);
+  if (recorder->fp == NULL)
     {
-      recorder->buffer = (tof_sample_t *)
-        malloc(sizeof(tof_sample_t) * recorder->capacity);
-      if (recorder->buffer != NULL)
-        {
-          break;
-        }
-    }
-
-  if (recorder->buffer == NULL)
-    {
-      printf("ERROR: ToF output buffer allocation failed.\n");
       recorder->failed = 1;
       return 1;
     }
 
-  recorder->fp = binary_file_open(TOF_LOG_PATH);
-  if (recorder->fp == NULL)
+  if (binary_stream_open(&recorder->stream,
+                         recorder->fp,
+                         sizeof(tof_sample_t),
+                         recorder->capacity,
+                         "ToF samples"))
     {
       recorder->failed = 1;
       return 1;
@@ -219,6 +177,7 @@ void tof_recorder_stop(tof_recorder_t *recorder)
 int tof_recorder_read_ready(tof_recorder_t *recorder)
 {
   tof_sample_t *sample;
+  tof_sample_t sample_data;
   uint64_t now_us;
   uint16_t distance_mm;
 
@@ -239,20 +198,20 @@ int tof_recorder_read_ready(tof_recorder_t *recorder)
       return 0;
     }
 
-  if (recorder->count >= recorder->capacity && tof_recorder_flush(recorder))
-    {
-      return -1;
-    }
-
   distance_mm = g_tof_sensor.read(false);
-  sample = &recorder->buffer[recorder->count];
+  sample = &sample_data;
   sample->session_time_us = tof_recorder_session_time_us(recorder, now_us);
   sample->sample_index = recorder->total;
   sample->distance_mm = distance_mm;
   sample->range_status = (uint8_t)g_tof_sensor.ranging_data.range_status;
   sample->timeout = g_tof_sensor.timeoutOccurred() ? 1 : 0;
 
-  recorder->count++;
+  if (binary_stream_append(&recorder->stream, sample))
+    {
+      recorder->failed = 1;
+      return -1;
+    }
+
   recorder->total++;
   return 1;
 }
@@ -268,9 +227,9 @@ int tof_recorder_finish(tof_recorder_t *recorder)
       tof_recorder_stop(recorder);
     }
 
-  if (!recorder->failed && recorder->fp != NULL && recorder->count > 0)
+  if (recorder->fp != NULL && binary_stream_close(&recorder->stream))
     {
-      tof_recorder_flush(recorder);
+      recorder->failed = 1;
     }
 
   if (recorder->fp != NULL && fclose(recorder->fp) != 0)
@@ -278,8 +237,6 @@ int tof_recorder_finish(tof_recorder_t *recorder)
       printf("ERROR: Failed to close log file %s. %d\n", TOF_LOG_PATH, errno);
       recorder->failed = 1;
     }
-
-  free(recorder->buffer);
 
   if (!recorder->failed)
     {

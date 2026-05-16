@@ -20,6 +20,7 @@ A5 は Spresense Arduino core の割り当てに合わせて HPADC1 (`/dev/hpadc
 | `tof_recorder.cpp` / `tof_recorder.h` | I2C0 の VL53L1X (`0x29`) 初期化、連続測距、ToF バイナリログへの保存を担当します。 |
 | `adc_a5_recorder.c` / `adc_a5_recorder.h` | `/dev/hpadc1` の設定、A5 生値の読み出し、ADC バイナリログへの保存を担当します。 |
 | `binary_file.c` / `binary_file.h` | バイナリログを上書きモードで開き、`fwrite()` の結果確認を共通化します。 |
+| `binary_stream.c` / `binary_stream.h` | 2面バッファと書き込みスレッドで、収録中のSD書き込みを担当します。 |
 
 ## 出力ファイル
 
@@ -77,6 +78,17 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 - ADC デバイス: `/dev/hpadc1`
 - ADC サンプリングレート: `16` kHz
 - ADC 周波数係数: `7`
+- IMU 2面バッファ: `1024` samples/面
+- ToF 2面バッファ: `64` samples/面
+- ADC A5 2面バッファ: `8192` samples/面
+
+## バッファ方式
+
+収録中のSD書き込みは `binary_stream.c` の2面バッファで行います。
+リングバッファは柔軟ですが、読み書き位置、満杯/空判定、欠落時の扱いが増えるため、
+この用途ではコード量が増えます。固定長2面バッファは「収録側が active 面に詰める」
+「満杯になった面を writer thread がSDへ書く」という役割に分けられるため、
+実装量を抑えつつ、収録時間をRAM容量から切り離せます。
 
 ## 必要な環境
 
@@ -90,6 +102,11 @@ ADC の `sample_index` はヘッダ直後からのレコード順で復元しま
 ## 注意点
 
 - バイナリログは収録開始時に上書きされます。過去ログを残す場合は、実行前に別名へ退避してください。
+- 収録中のSD書き込みは2面バッファと書き込みスレッドで行います。
+  SD書き込みが追いつかず2面とも埋まった場合は、サンプル欠落を避けるため
+  エラーとして収録を止めます。
+- 実行中の `BUF` 表示はIMUの active 面使用率です。面の切り替え後に
+  `0%` 付近へ戻るのは正常で、収録全体の進捗率ではありません。
 - 各ログの `session_start_us` は同じ CLOCK_MONOTONIC 基準時刻です。
   CSV復元時は各行に `session_time_us` と `monotonic_us` を出力します。
 - バイナリ値は Spresense 側のネイティブ表現です。別環境で読む場合はヘッダの `record_size` を確認してください。

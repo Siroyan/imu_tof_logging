@@ -67,21 +67,23 @@ static int drain_adc_samples(adc_a5_recorder_t *adc)
 }
 
 /*
- * IMU バッファの使用率を一定間隔で表示する。
- * ADC は高レートで取得するため、ここでは既存の進捗表示として IMU 側だけを見る。
+ * IMU の active 面バッファ使用率を一定間隔で表示する。
+ * 2面バッファの切り替え後は0付近へ戻るため、収録進捗ではなく滞留量を見るログになる。
  */
 static void report_buffer_usage(imu_recorder_t *imu,
                                 struct timespec *now,
                                 struct timespec *prev)
 {
+  int count;
   struct timespec delta;
 
   clock_timespec_subtract(now, prev, &delta);
   if (delta.tv_sec > 0 || delta.tv_nsec >= 250000000L)
     {
+      count = imu_recorder_buffer_count(imu);
       printf("BUF %.1f%% (%d/%d)\n",
-             imu->count * 100.0f / (float)imu->capacity,
-             imu->count,
+             count * 100.0f / (float)imu->capacity,
+             count,
              imu->capacity);
       *prev = *now;
     }
@@ -135,13 +137,13 @@ int capture_session_run(void)
       return 1;
     }
 
-  printf("IMU buffer: %d samples (%.3f sec)\n",
+  printf("IMU stream buffer: %d samples/face (%.3f sec)\n",
          imu.capacity,
          imu.capacity / (float)IMU_RECORDER_SAMPLE_RATE_HZ);
-  printf("ADC A5 buffer: %d samples (%.3f sec)\n",
+  printf("ADC A5 stream buffer: %d samples/face (%.3f sec)\n",
          adc.capacity,
          adc.capacity / (float)ADC_A5_RECORDER_SAMPLE_RATE_HZ);
-  printf("ToF buffer: %d samples (%.3f sec)\n",
+  printf("ToF stream buffer: %d samples/face (%.3f sec)\n",
          tof.capacity,
          tof.capacity / (float)TOF_RECORDER_SAMPLE_RATE_HZ);
 

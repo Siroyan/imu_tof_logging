@@ -1,6 +1,8 @@
 #ifndef IMU_RECORDER_H
 #define IMU_RECORDER_H
 
+#include "binary_stream.h"
+
 #include <nuttx/sensors/cxd5602pwbimu.h>
 
 #include <stdint.h>
@@ -19,9 +21,8 @@ typedef struct imu_recorder_s
 {
   int fd;
   FILE *fp;
-  imu_sample_t *buffer;
+  binary_stream_t stream;
   int capacity;
-  int count;
   int total;
   uint64_t session_start_us;
   int failed;
@@ -41,6 +42,9 @@ void imu_recorder_stop(imu_recorder_t *recorder);
 
 /* 読み出し可能になった IMU サンプルをバッファへ取り込む。 */
 int imu_recorder_read_ready(imu_recorder_t *recorder);
+
+/* 収録側のactiveバッファに残っているIMUサンプル数を返す。 */
+int imu_recorder_buffer_count(const imu_recorder_t *recorder);
 
 /* 残りサンプルの保存とリソース解放を行う。 */
 int imu_recorder_finish(imu_recorder_t *recorder);

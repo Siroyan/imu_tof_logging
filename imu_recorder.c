@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -18,6 +18,7 @@
 #define IMU_ACCEL_RANGE       2
 #define IMU_GYRO_RANGE        125
 #define IMU_FIFO_THRESHOLD    1
+#define IMU_STREAM_BUFFER_SAMPLES 1024
 
 typedef struct imu_log_header_s
 {
@@ -66,42 +67,6 @@ int imu_recorder_write_header(imu_recorder_t *recorder, uint64_t session_start_u
 }
 
 /*
- * RAM に蓄積した IMU サンプルをバイナリで書き出す。
- * 収録中の SD 書き込みを極力減らすため、通常は終了処理でまとめて呼ばれる。
- */
-static int imu_recorder_flush(imu_recorder_t *recorder)
-{
-  if (recorder->count == 0)
-    {
-      return 0;
-    }
-
-  /*
-   * 共通時刻と cxd5602pwbimu_data_t を組にして連続保存する。
-   * CSV化やIMU timestamp秒換算は、必要に応じて後段の変換処理で行う。
-   */
-  if (binary_file_write(recorder->fp,
-                        recorder->buffer,
-                        sizeof(recorder->buffer[0]),
-                        recorder->count,
-                        "IMU samples"))
-    {
-      recorder->failed = 1;
-      return 1;
-    }
-
-  if (fflush(recorder->fp) != 0)
-    {
-      printf("ERROR: Failed to flush IMU data to SD. %d\n", errno);
-      recorder->failed = 1;
-      return 1;
-    }
-
-  recorder->count = 0;
-  return 0;
-}
-
-/*
  * CXD5602PWBIMU のサンプリング条件を設定して計測を開始する。
  * レート、レンジ、FIFOしきい値はこのファイル内の定数で固定する。
  */
@@ -140,17 +105,16 @@ static int imu_start_sensing(int fd)
 
 /*
  * IMU recorder のデバイス、出力バイナリ、RAMバッファを準備する。
- * バッファは指定秒数分を目標に確保し、足りない場合は半分ずつ下げて確保を試す。
+ * IMU は2面バッファで受け、満杯になった面からSDへ非同期に書き出す。
  */
 int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
 {
-  int target_samples;
+  (void)capture_seconds;
 
   recorder->fd = -1;
   recorder->fp = NULL;
-  recorder->buffer = NULL;
-  recorder->capacity = 0;
-  recorder->count = 0;
+  memset(&recorder->stream, 0, sizeof(recorder->stream));
+  recorder->capacity = IMU_STREAM_BUFFER_SAMPLES;
   recorder->total = 0;
   recorder->session_start_us = 0;
   recorder->failed = 0;
@@ -164,29 +128,18 @@ int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
-  /* まず収録時間全体を保持できる容量を狙い、確保できなければ縮小する。 */
-  target_samples = IMU_RECORDER_SAMPLE_RATE_HZ * capture_seconds;
-  for (recorder->capacity = target_samples;
-       recorder->capacity >= 1;
-       recorder->capacity /= 2)
+  recorder->fp = binary_file_open(IMU_LOG_PATH);
+  if (recorder->fp == NULL)
     {
-      recorder->buffer = (imu_sample_t *)
-        malloc(sizeof(imu_sample_t) * recorder->capacity);
-      if (recorder->buffer != NULL)
-        {
-          break;
-        }
-    }
-
-  if (recorder->buffer == NULL)
-    {
-      printf("ERROR: Output buffer allocation failed.\n");
       recorder->failed = 1;
       return 1;
     }
 
-  recorder->fp = binary_file_open(IMU_LOG_PATH);
-  if (recorder->fp == NULL)
+  if (binary_stream_open(&recorder->stream,
+                         recorder->fp,
+                         sizeof(imu_sample_t),
+                         recorder->capacity,
+                         "IMU samples"))
     {
       recorder->failed = 1;
       return 1;
@@ -212,30 +165,34 @@ void imu_recorder_stop(imu_recorder_t *recorder)
 
 /*
  * poll() で読み出し可能になった IMU サンプルを 1 件取り込む。
- * バッファが満杯の場合はバイナリへ退避してから次のサンプルを格納する。
+ * active 面が満杯の場合は writer thread へ渡し、空き面へ切り替えてから格納する。
  */
 int imu_recorder_read_ready(imu_recorder_t *recorder)
 {
   int ret;
-  imu_sample_t *sample;
+  imu_sample_t sample;
 
-  if (recorder->count >= recorder->capacity && imu_recorder_flush(recorder))
-    {
-      return -1;
-    }
-
-  sample = &recorder->buffer[recorder->count];
-  ret = read(recorder->fd, &sample->data, sizeof(sample->data));
-  if (ret != sizeof(sample->data))
+  ret = read(recorder->fd, &sample.data, sizeof(sample.data));
+  if (ret != sizeof(sample.data))
     {
       printf("ERROR: read size mismatch! %d\n", ret);
       return 0;
     }
 
-  sample->session_time_us = imu_recorder_session_time_us(recorder);
-  recorder->count++;
+  sample.session_time_us = imu_recorder_session_time_us(recorder);
+  if (binary_stream_append(&recorder->stream, &sample))
+    {
+      recorder->failed = 1;
+      return -1;
+    }
+
   recorder->total++;
   return 1;
+}
+
+int imu_recorder_buffer_count(const imu_recorder_t *recorder)
+{
+  return binary_stream_count(&recorder->stream);
 }
 
 /*
@@ -244,9 +201,9 @@ int imu_recorder_read_ready(imu_recorder_t *recorder)
  */
 int imu_recorder_finish(imu_recorder_t *recorder)
 {
-  if (!recorder->failed && recorder->fp != NULL && recorder->count > 0)
+  if (recorder->fp != NULL && binary_stream_close(&recorder->stream))
     {
-      imu_recorder_flush(recorder);
+      recorder->failed = 1;
     }
 
   if (recorder->fp != NULL && fclose(recorder->fp) != 0)
@@ -259,8 +216,6 @@ int imu_recorder_finish(imu_recorder_t *recorder)
     {
       close(recorder->fd);
     }
-
-  free(recorder->buffer);
 
   if (!recorder->failed)
     {
