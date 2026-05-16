@@ -59,7 +59,7 @@
  ****************************************************************************/
 
 #define CXD5602PWBIMU_DEVPATH      "/dev/imu0"
-#define IMU_LOG_PATH               "/mnt/sd0/imu_log.csv"
+#define IMU_TOF_LOG_PATH           "/mnt/sd0/imu_tof_log.csv"
 #define MAX_CAPTURE_SECONDS        10
 #define LOG_FLUSH_CHUNK_SAMPLES    128
 
@@ -68,6 +68,23 @@
 /****************************************************************************
  * Private values
  ****************************************************************************/
+
+typedef struct tof_sample_s
+{
+  uint64_t timestamp_ms;
+  int32_t distance_mm;
+  int32_t status;
+} tof_sample_t;
+
+typedef struct imu_tof_record_s
+{
+  cxd5602pwbimu_data_t imu;
+  uint64_t tof_timestamp_ms;
+  int32_t tof_distance_mm;
+  int32_t tof_status;
+} imu_tof_record_t;
+
+extern int tof4m_poll_sample(tof_sample_t *sample);
 
 /****************************************************************************
  * Private Functions
@@ -93,7 +110,9 @@ static FAR FILE *open_log_file(FAR const char *path)
 
   if (need_header)
     {
-      if (fprintf(fp, "timestamp,temp,gx,gy,gz,ax,ay,az\n") < 0)
+      if (fprintf(fp, "imu_timestamp,imu_temp,imu_gx,imu_gy,imu_gz,"
+                      "imu_ax,imu_ay,imu_az,tof_timestamp_ms,"
+                      "tof_distance_mm,tof_status\n") < 0)
         {
           printf("ERROR: Failed to write CSV header. %d\n", errno);
           fclose(fp);
@@ -105,20 +124,24 @@ static FAR FILE *open_log_file(FAR const char *path)
 }
 
 static int append_sensing_data(FAR FILE *fp,
-                               FAR cxd5602pwbimu_data_t *first,
-                               FAR cxd5602pwbimu_data_t *last)
+                               FAR imu_tof_record_t *first,
+                               FAR imu_tof_record_t *last)
 {
-  FAR cxd5602pwbimu_data_t *p;
+  FAR imu_tof_record_t *p;
 
   for (p = first; p < last; p++)
     {
-      if (fprintf(fp, "%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
-                  p->timestamp / 19200000.0f,
-                  p->temp,
-                  p->gx, p->gy, p->gz,
-                  p->ax, p->ay, p->az) < 0)
+      if (fprintf(fp, "%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
+                      "%" PRIu64 ",%" PRId32 ",%" PRId32 "\n",
+                  p->imu.timestamp / 19200000.0f,
+                  p->imu.temp,
+                  p->imu.gx, p->imu.gy, p->imu.gz,
+                  p->imu.ax, p->imu.ay, p->imu.az,
+                  p->tof_timestamp_ms,
+                  p->tof_distance_mm,
+                  p->tof_status) < 0)
         {
-          printf("ERROR: Failed to write IMU data. %d\n", errno);
+          printf("ERROR: Failed to write IMU/ToF data. %d\n", errno);
           return 1;
         }
     }
@@ -214,9 +237,15 @@ int main(int argc, FAR char *argv[])
   int buffer_samples;
   int flush_threshold;
   int report_started = 0;
+  int tof_available = 0;
+  int tof_poll_error_reported = 0;
+  int total_tof_samples = 0;
+  int tof_poll_ret;
   struct pollfd fds[1];
   struct timespec start, now, delta, report_prev, report_delta;
-  cxd5602pwbimu_data_t *outbuf = NULL;
+  imu_tof_record_t *outbuf = NULL;
+  tof_sample_t tof_latest;
+  tof_sample_t tof_sample;
   FAR FILE *logfp = NULL;
 
   /* Sensing parameters, see start sensing function. */
@@ -237,8 +266,8 @@ int main(int argc, FAR char *argv[])
   buffer_samples = target_buffer_samples;
   while (buffer_samples >= 1)
     {
-      outbuf = (cxd5602pwbimu_data_t *)malloc(sizeof(cxd5602pwbimu_data_t) *
-                                              buffer_samples);
+      outbuf = (imu_tof_record_t *)malloc(sizeof(imu_tof_record_t) *
+                                          buffer_samples);
       if (outbuf != NULL)
         {
           break;
@@ -271,7 +300,7 @@ int main(int argc, FAR char *argv[])
   fds[0].fd = fd;
   fds[0].events = POLLIN;
 
-  logfp = open_log_file(IMU_LOG_PATH);
+  logfp = open_log_file(IMU_TOF_LOG_PATH);
   if (logfp == NULL)
     {
       close(fd);
@@ -293,9 +322,24 @@ int main(int argc, FAR char *argv[])
   memset(&delta, 0, sizeof(delta));
   memset(&report_prev, 0, sizeof(report_prev));
   memset(&report_delta, 0, sizeof(report_delta));
+  memset(&tof_latest, 0, sizeof(tof_latest));
+  memset(&tof_sample, 0, sizeof(tof_sample));
 
   while (1)
     {
+      tof_poll_ret = tof4m_poll_sample(&tof_sample);
+      if (tof_poll_ret > 0)
+        {
+          tof_latest = tof_sample;
+          tof_available = 1;
+          total_tof_samples++;
+        }
+      else if (tof_poll_ret < 0 && !tof_poll_error_reported)
+        {
+          printf("WARNING: ToF polling is unavailable (%d).\n", tof_poll_ret);
+          tof_poll_error_reported = 1;
+        }
+
       ret = poll(fds, 1, 1000);
       if (ret < 0)
         {
@@ -324,8 +368,9 @@ int main(int argc, FAR char *argv[])
               buffered_samples = 0;
             }
 
-          ret = read(fd, &outbuf[buffered_samples], sizeof(*outbuf));
-          if (ret == sizeof(*outbuf))
+          ret = read(fd, &outbuf[buffered_samples].imu,
+                     sizeof(outbuf[buffered_samples].imu));
+          if (ret == sizeof(outbuf[buffered_samples].imu))
             {
               if (!started)
                 {
@@ -337,6 +382,19 @@ int main(int argc, FAR char *argv[])
                   report_prev = start;
                   started = 1;
                   report_started = 1;
+                }
+
+              if (tof_available)
+                {
+                  outbuf[buffered_samples].tof_timestamp_ms = tof_latest.timestamp_ms;
+                  outbuf[buffered_samples].tof_distance_mm = tof_latest.distance_mm;
+                  outbuf[buffered_samples].tof_status = tof_latest.status;
+                }
+              else
+                {
+                  outbuf[buffered_samples].tof_timestamp_ms = 0;
+                  outbuf[buffered_samples].tof_distance_mm = -1;
+                  outbuf[buffered_samples].tof_status = -1;
                 }
 
               buffered_samples++;
@@ -396,7 +454,7 @@ int main(int argc, FAR char *argv[])
 
   if (fclose(logfp) != 0)
     {
-      printf("ERROR: Failed to close log file %s. %d\n", IMU_LOG_PATH, errno);
+      printf("ERROR: Failed to close log file %s. %d\n", IMU_TOF_LOG_PATH, errno);
       write_failed = 1;
     }
 
@@ -404,11 +462,11 @@ int main(int argc, FAR char *argv[])
 
   if (!write_failed)
     {
-      printf("Saved samples to %s while sampling.\n", IMU_LOG_PATH);
+      printf("Saved samples to %s while sampling.\n", IMU_TOF_LOG_PATH);
     }
   else
     {
-      printf("WARNING: Failed to save all samples to %s\n", IMU_LOG_PATH);
+      printf("WARNING: Failed to save all samples to %s\n", IMU_TOF_LOG_PATH);
     }
 
   if (started)
@@ -423,6 +481,7 @@ int main(int argc, FAR char *argv[])
 
   printf("Elapsed %ld.%09ld seconds\n", delta.tv_sec, delta.tv_nsec);
   printf("%d samples captured\n", total_samples);
+  printf("%d ToF samples captured\n", total_tof_samples);
   printf("Finished.\n");
 
   free(outbuf);
