@@ -241,6 +241,11 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
   return samples_read;
 }
 
+int adc_a5_recorder_buffer_count(const adc_a5_recorder_t *recorder)
+{
+  return binary_stream_count(&recorder->stream);
+}
+
 /*
  * 残った ADC サンプルを書き出し、バイナリ、デバイス、RAMバッファを解放する。
  * 戻り値は保存または後始末で失敗があったかどうかを示す。

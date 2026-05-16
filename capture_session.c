@@ -11,7 +11,7 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_CAPTURE_SECONDS 10
+#define MAX_CAPTURE_SECONDS 30
 #define ADC_DRAIN_READ_LIMIT 16
 
 /* CLOCK_MONOTONIC の timespec を、ログヘッダ用の us 単位へ変換する。 */
@@ -67,24 +67,30 @@ static int drain_adc_samples(adc_a5_recorder_t *adc)
 }
 
 /*
- * IMU の active 面バッファ使用率を一定間隔で表示する。
+ * IMU と ADC A5 の active 面バッファ使用率を一定間隔で表示する。
  * 2面バッファの切り替え後は0付近へ戻るため、収録進捗ではなく滞留量を見るログになる。
  */
 static void report_buffer_usage(imu_recorder_t *imu,
+                                adc_a5_recorder_t *adc,
                                 struct timespec *now,
                                 struct timespec *prev)
 {
-  int count;
+  int adc_count;
+  int imu_count;
   struct timespec delta;
 
   clock_timespec_subtract(now, prev, &delta);
   if (delta.tv_sec > 0 || delta.tv_nsec >= 250000000L)
     {
-      count = imu_recorder_buffer_count(imu);
-      printf("BUF %.1f%% (%d/%d)\n",
-             count * 100.0f / (float)imu->capacity,
-             count,
-             imu->capacity);
+      imu_count = imu_recorder_buffer_count(imu);
+      adc_count = adc_a5_recorder_buffer_count(adc);
+      printf("BUF IMU %.1f%% (%d/%d), ADC %.1f%% (%d/%d)\n",
+             imu_count * 100.0f / (float)imu->capacity,
+             imu_count,
+             imu->capacity,
+             adc_count * 100.0f / (float)adc->capacity,
+             adc_count,
+             adc->capacity);
       *prev = *now;
     }
 }
@@ -215,7 +221,7 @@ int capture_session_run(void)
             }
           clock_gettime(CLOCK_MONOTONIC, &now);
           clock_timespec_subtract(&now, &start, &elapsed);
-          report_buffer_usage(&imu, &now, &report_prev);
+          report_buffer_usage(&imu, &adc, &now, &report_prev);
           if (elapsed.tv_sec >= MAX_CAPTURE_SECONDS)
             {
               break;
@@ -255,7 +261,7 @@ int capture_session_run(void)
           clock_gettime(CLOCK_MONOTONIC, &now);
           clock_timespec_subtract(&now, &start, &elapsed);
 
-          report_buffer_usage(&imu, &now, &report_prev);
+          report_buffer_usage(&imu, &adc, &now, &report_prev);
 
           if (elapsed.tv_sec >= MAX_CAPTURE_SECONDS)
             {

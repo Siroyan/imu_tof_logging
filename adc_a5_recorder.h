@@ -36,6 +36,9 @@ void adc_a5_recorder_stop(adc_a5_recorder_t *recorder);
 /* 読み出し可能になった ADC サンプルをバッファへ取り込む。 */
 int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder);
 
+/* 収録側のactiveバッファに残っているADC A5サンプル数を返す。 */
+int adc_a5_recorder_buffer_count(const adc_a5_recorder_t *recorder);
+
 /* 残りサンプルの保存とリソース解放を行う。 */
 int adc_a5_recorder_finish(adc_a5_recorder_t *recorder);
 

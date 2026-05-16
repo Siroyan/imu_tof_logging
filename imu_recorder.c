@@ -18,7 +18,7 @@
 #define IMU_ACCEL_RANGE       2
 #define IMU_GYRO_RANGE        125
 #define IMU_FIFO_THRESHOLD    1
-#define IMU_STREAM_BUFFER_SAMPLES 1024
+#define IMU_STREAM_BUFFER_SAMPLES 2048
 
 typedef struct imu_log_header_s
 {
