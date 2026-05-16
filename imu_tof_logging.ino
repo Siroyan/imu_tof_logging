@@ -15,6 +15,68 @@ extern "C" int main(int argc, char *argv[]);
 #endif
 #define RECORD_TRIGGER_NAME      "Digital2"
 #define RECORD_TRIGGER_STABLE_MS 50
+#define STATUS_LED_BLINK_MS      500
+
+static const uint8_t STATUS_LEDS[] = {LED0, LED1, LED2, LED3};
+
+static void set_status_leds(int led0, int led1, int led2, int led3)
+{
+  digitalWrite(STATUS_LEDS[0], led0 ? HIGH : LOW);
+  digitalWrite(STATUS_LEDS[1], led1 ? HIGH : LOW);
+  digitalWrite(STATUS_LEDS[2], led2 ? HIGH : LOW);
+  digitalWrite(STATUS_LEDS[3], led3 ? HIGH : LOW);
+}
+
+static void initialize_status_leds(void)
+{
+  int i;
+
+  for (i = 0; i < 4; i++)
+    {
+      pinMode(STATUS_LEDS[i], OUTPUT);
+    }
+
+  set_status_leds(0, 0, 0, 0);
+}
+
+/* レコーディング待機中は LED0 を点滅させる。 */
+static void update_waiting_leds(void)
+{
+  static int initialized = 0;
+  static int led_on = 0;
+  static unsigned long last_toggle_ms = 0;
+  unsigned long now_ms = millis();
+
+  if (!initialized || now_ms - last_toggle_ms >= STATUS_LED_BLINK_MS)
+    {
+      initialized = 1;
+      led_on = !led_on;
+      last_toggle_ms = now_ms;
+      set_status_leds(led_on, 0, 0, 0);
+    }
+}
+
+/* レコーディング中は4灯を点灯させる。 */
+static void set_recording_leds(void)
+{
+  set_status_leds(1, 1, 1, 1);
+}
+
+/*
+ * レコーディング後は LED3 を点灯させる。
+ * エラー終了時は LED0 も点灯させ、正常終了と区別する。
+ */
+static void set_finished_leds(int result)
+{
+  if (result == 0)
+    {
+      set_status_leds(0, 0, 0, 1);
+    }
+  else
+    {
+      set_status_leds(1, 0, 0, 1);
+    }
+}
 
 static int is_trigger_level_stable(int level)
 {
@@ -40,6 +102,7 @@ static void wait_recording_trigger(void)
 
   while (!is_trigger_level_stable(LOW))
     {
+      update_waiting_leds();
       delay(10);
     }
 
@@ -48,6 +111,7 @@ static void wait_recording_trigger(void)
 
   while (1)
     {
+      update_waiting_leds();
       if (is_trigger_level_stable(HIGH))
         {
           printf("Recording trigger detected.\n");
@@ -61,6 +125,11 @@ static void wait_recording_trigger(void)
 void setup(void)
 {
   int ret;
+  int main_result;
+
+  initialize_status_leds();
+  update_waiting_leds();
+
   ret = board_cxd5602pwbimu_initialize(5);
   if (ret < 0)
     {
@@ -81,7 +150,9 @@ void setup(void)
     }
 
   wait_recording_trigger();
-  main(0, NULL);
+  set_recording_leds();
+  main_result = main(0, NULL);
+  set_finished_leds(main_result);
 }
 
 void loop()
