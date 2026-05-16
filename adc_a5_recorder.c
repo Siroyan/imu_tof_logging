@@ -16,7 +16,7 @@
 #define ADC_A5_DEVPATH           "/dev/hpadc1"
 #define ADC_A5_LOG_PATH          "/mnt/sd0/adc_a5_log.bin"
 #define ADC_A5_LOG_MAGIC         "ADCA5L1"
-#define ADC_A5_LOG_VERSION       1
+#define ADC_A5_LOG_VERSION       2
 #define ADC_A5_FREQ_COEFFICIENT  7
 #define ADC_A5_READ_CHUNK_SAMPLES 128
 #define ADC_A5_REFERENCE_VOLTAGE 5.0f
@@ -41,28 +41,39 @@ typedef struct adc_a5_log_header_s
   uint32_t version;
   uint32_t sample_rate_hz;
   uint32_t record_size;
+  uint32_t reserved0;
+  uint64_t session_start_us;
   float reference_voltage;
   int16_t raw_min;
   int16_t raw_max;
+  uint32_t reserved1;
+  uint32_t reserved2;
 } adc_a5_log_header_t;
 
 /*
  * ADC A5 バイナリログの先頭ヘッダを書き込む。
- * サンプル本体は int16_t raw の連続データで、sample_index はレコード順から復元する。
+ * サンプル本体は int16_t raw の連続データで、時刻は共通開始時刻とsample_indexから復元する。
  */
-static int adc_a5_recorder_write_header(FILE *fp)
+int adc_a5_recorder_write_header(adc_a5_recorder_t *recorder,
+                                 uint64_t session_start_us)
 {
   adc_a5_log_header_t header = {
     ADC_A5_LOG_MAGIC,
     ADC_A5_LOG_VERSION,
     ADC_A5_RECORDER_SAMPLE_RATE_HZ,
     sizeof(int16_t),
+    0,
+    session_start_us,
     ADC_A5_REFERENCE_VOLTAGE,
     ADC_A5_RAW_MIN,
-    ADC_A5_RAW_MAX
+    ADC_A5_RAW_MAX,
+    0,
+    0
   };
 
-  return binary_file_write(fp, &header, sizeof(header), 1, "ADC A5 binary header");
+  recorder->session_start_us = session_start_us;
+  return binary_file_write(recorder->fp, &header, sizeof(header), 1,
+                           "ADC A5 binary header");
 }
 
 /*
@@ -127,6 +138,7 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
   recorder->count = 0;
   recorder->first_index = 0;
   recorder->total = 0;
+  recorder->session_start_us = 0;
   recorder->failed = 0;
 
   /*
@@ -163,12 +175,6 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
 
   recorder->fp = binary_file_open(ADC_A5_LOG_PATH);
   if (recorder->fp == NULL)
-    {
-      recorder->failed = 1;
-      return 1;
-    }
-
-  if (adc_a5_recorder_write_header(recorder->fp))
     {
       recorder->failed = 1;
       return 1;

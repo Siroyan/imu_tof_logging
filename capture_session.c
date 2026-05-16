@@ -14,6 +14,12 @@
 #define MAX_CAPTURE_SECONDS 10
 #define ADC_DRAIN_READ_LIMIT 16
 
+/* CLOCK_MONOTONIC の timespec を、ログヘッダ用の us 単位へ変換する。 */
+static uint64_t timespec_to_us(const struct timespec *ts)
+{
+  return (uint64_t)ts->tv_sec * 1000000ULL + (uint64_t)ts->tv_nsec / 1000ULL;
+}
+
 /*
  * IMU を poll() で待つ。
  * HPADC1 は poll() 未対応の環境があるため、poll 対象には含めない。
@@ -90,10 +96,10 @@ int capture_session_run(void)
 {
   int ret;
   int started = 0;
-  int report_started = 0;
   int capture_failed = 0;
+  uint64_t session_start_us = 0;
   struct pollfd imu_fd;
-  struct timespec start, now, elapsed, report_prev;
+  struct timespec start, now, elapsed, report_prev, capture_end;
   imu_recorder_t imu;
   adc_a5_recorder_t adc;
   tof_recorder_t tof;
@@ -102,6 +108,7 @@ int capture_session_run(void)
   memset(&now, 0, sizeof(now));
   memset(&elapsed, 0, sizeof(elapsed));
   memset(&report_prev, 0, sizeof(report_prev));
+  memset(&capture_end, 0, sizeof(capture_end));
 
   /* 先に各 recorder のデバイス、バイナリログ、RAMバッファを準備する。 */
   ret = imu_recorder_open(&imu, MAX_CAPTURE_SECONDS);
@@ -142,8 +149,8 @@ int capture_session_run(void)
   imu_fd.events = POLLIN;
 
   /*
-   * ToF を先に連続測距へ入れてから IMU と ADC を開始する。
-   * ADC の余分な先行サンプルを減らしつつ、収録時間の基準はIMUに合わせる。
+   * ToF と IMU を先に開始し、ADC開始直前の CLOCK_MONOTONIC を
+   * 3センサ共通の収録開始時刻としてログヘッダに保存する。
    */
   if (tof_recorder_start(&tof))
     {
@@ -158,6 +165,9 @@ int capture_session_run(void)
       goto finish;
     }
 
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  session_start_us = timespec_to_us(&start);
+
   if (adc_a5_recorder_start(&adc))
     {
       capture_failed = 1;
@@ -165,6 +175,20 @@ int capture_session_run(void)
       tof_recorder_stop(&tof);
       goto finish;
     }
+
+  if (imu_recorder_write_header(&imu, session_start_us) ||
+      adc_a5_recorder_write_header(&adc, session_start_us) ||
+      tof_recorder_write_header(&tof, session_start_us))
+    {
+      capture_failed = 1;
+      adc_a5_recorder_stop(&adc);
+      imu_recorder_stop(&imu);
+      tof_recorder_stop(&tof);
+      goto finish;
+    }
+
+  report_prev = start;
+  started = 1;
 
   while (1)
     {
@@ -185,6 +209,13 @@ int capture_session_run(void)
           if (tof_recorder_read_ready(&tof) < 0)
             {
               capture_failed = 1;
+              break;
+            }
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          clock_timespec_subtract(&now, &start, &elapsed);
+          report_buffer_usage(&imu, &now, &report_prev);
+          if (elapsed.tv_sec >= MAX_CAPTURE_SECONDS)
+            {
               break;
             }
           continue;
@@ -208,19 +239,11 @@ int capture_session_run(void)
 
       if (imu_fd.revents & POLLIN)
         {
-          /* 最初の IMU サンプルを収録開始時刻の基準にする。 */
           ret = imu_recorder_read_ready(&imu);
           if (ret < 0)
             {
               capture_failed = 1;
               break;
-            }
-          if (ret > 0 && !started)
-            {
-              clock_gettime(CLOCK_MONOTONIC, &start);
-              report_prev = start;
-              started = 1;
-              report_started = 1;
             }
         }
 
@@ -230,16 +253,19 @@ int capture_session_run(void)
           clock_gettime(CLOCK_MONOTONIC, &now);
           clock_timespec_subtract(&now, &start, &elapsed);
 
-          if (report_started)
-            {
-              report_buffer_usage(&imu, &now, &report_prev);
-            }
+          report_buffer_usage(&imu, &now, &report_prev);
 
           if (elapsed.tv_sec >= MAX_CAPTURE_SECONDS)
             {
               break;
             }
         }
+    }
+
+  if (started)
+    {
+      clock_gettime(CLOCK_MONOTONIC, &capture_end);
+      clock_timespec_subtract(&capture_end, &start, &elapsed);
     }
 
   /* ループを抜けたら、まずサンプリングを止めてから残りのバイナリ保存に進む。 */
@@ -253,12 +279,7 @@ finish:
   capture_failed |= adc_a5_recorder_finish(&adc);
   capture_failed |= imu_recorder_finish(&imu);
 
-  if (started)
-    {
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      clock_timespec_subtract(&now, &start, &elapsed);
-    }
-  else
+  if (!started)
     {
       memset(&elapsed, 0, sizeof(elapsed));
     }

@@ -9,7 +9,7 @@
 
 typedef struct tof_sample_s
 {
-  uint64_t timestamp_us;
+  uint64_t session_time_us;
   uint32_t sample_index;
   uint16_t distance_mm;
   uint8_t range_status;
@@ -25,6 +25,7 @@ typedef struct tof_recorder_s
   int count;
   uint32_t total;
   uint64_t next_check_us;
+  uint64_t session_start_us;
   int failed;
   int started;
 } tof_recorder_t;
@@ -35,6 +36,9 @@ extern "C" {
 
 /* VL53L1X、バイナリログ、収録バッファを準備する。 */
 int tof_recorder_open(tof_recorder_t *recorder, int capture_seconds);
+
+/* 共通収録開始時刻を含むToFバイナリヘッダを書き込む。 */
+int tof_recorder_write_header(tof_recorder_t *recorder, uint64_t session_start_us);
 
 /* I2C0上のVL53L1Xを初期化し、連続測距を開始する。 */
 int tof_recorder_start(tof_recorder_t *recorder);

@@ -16,11 +16,16 @@ typedef struct adc_a5_recorder_s
   int count;
   uint32_t first_index;
   uint32_t total;
+  uint64_t session_start_us;
   int failed;
 } adc_a5_recorder_t;
 
 /* /dev/hpadc1、バイナリログ、収録バッファを準備する。 */
 int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds);
+
+/* 共通収録開始時刻を含むADC A5バイナリヘッダを書き込む。 */
+int adc_a5_recorder_write_header(adc_a5_recorder_t *recorder,
+                                 uint64_t session_start_us);
 
 /* HPADC1/A5 のサンプリングを開始する。 */
 int adc_a5_recorder_start(adc_a5_recorder_t *recorder);

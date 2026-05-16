@@ -3,24 +3,35 @@
 
 #include <nuttx/sensors/cxd5602pwbimu.h>
 
+#include <stdint.h>
 #include <stdio.h>
 
 #define IMU_RECORDER_SAMPLE_RATE_HZ  1920
+
+typedef struct imu_sample_s
+{
+  uint64_t session_time_us;
+  cxd5602pwbimu_data_t data;
+} imu_sample_t;
 
 /* IMU デバイス、バイナリログ、RAMバッファの状態をまとめて保持する。 */
 typedef struct imu_recorder_s
 {
   int fd;
   FILE *fp;
-  cxd5602pwbimu_data_t *buffer;
+  imu_sample_t *buffer;
   int capacity;
   int count;
   int total;
+  uint64_t session_start_us;
   int failed;
 } imu_recorder_t;
 
 /* /dev/imu0、バイナリログ、収録バッファを準備する。 */
 int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds);
+
+/* 共通収録開始時刻を含むIMUバイナリヘッダを書き込む。 */
+int imu_recorder_write_header(imu_recorder_t *recorder, uint64_t session_start_us);
 
 /* IMU のサンプリングを開始する。 */
 int imu_recorder_start(imu_recorder_t *recorder);

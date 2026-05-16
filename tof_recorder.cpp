@@ -14,7 +14,7 @@
 
 #define TOF_LOG_PATH             "/mnt/sd0/tof_log.bin"
 #define TOF_LOG_MAGIC            "TOFLOG1"
-#define TOF_LOG_VERSION          1
+#define TOF_LOG_VERSION          2
 #define TOF_I2C_ADDRESS          0x29
 #define TOF_I2C_CLOCK_HZ         400000
 #define TOF_WIRE_TIMEOUT_US      100000
@@ -30,11 +30,13 @@ typedef struct tof_log_header_s
   uint32_t sample_period_ms;
   uint32_t timing_budget_us;
   uint32_t record_size;
+  uint32_t reserved;
+  uint64_t session_start_us;
 } tof_log_header_t;
 
 static VL53L1X g_tof_sensor;
 
-/* CLOCK_MONOTONIC を us 単位に変換し、ToF 読み出し時刻として保存する。 */
+/* CLOCK_MONOTONIC を us 単位に変換する。 */
 static uint64_t tof_recorder_monotonic_us(void)
 {
   struct timespec ts;
@@ -43,11 +45,23 @@ static uint64_t tof_recorder_monotonic_us(void)
   return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+/* 共通収録開始時刻を原点にしたToF読み出し時刻を作る。 */
+static uint64_t tof_recorder_session_time_us(const tof_recorder_t *recorder,
+                                             uint64_t now_us)
+{
+  if (now_us < recorder->session_start_us)
+    {
+      return 0;
+    }
+
+  return now_us - recorder->session_start_us;
+}
+
 /*
  * ToF バイナリログの先頭ヘッダを書き込む。
- * サンプル本体は tof_sample_t の連続データとして保存する。
+ * サンプル本体は、共通開始時刻からの経過usを持つ tof_sample_t として保存する。
  */
-static int tof_recorder_write_header(FILE *fp)
+int tof_recorder_write_header(tof_recorder_t *recorder, uint64_t session_start_us)
 {
   tof_log_header_t header = {
     TOF_LOG_MAGIC,
@@ -55,10 +69,14 @@ static int tof_recorder_write_header(FILE *fp)
     TOF_I2C_ADDRESS,
     TOF_RECORDER_SAMPLE_PERIOD_MS,
     TOF_TIMING_BUDGET_US,
-    sizeof(tof_sample_t)
+    sizeof(tof_sample_t),
+    0,
+    session_start_us
   };
 
-  return binary_file_write(fp, &header, sizeof(header), 1, "ToF binary header");
+  recorder->session_start_us = session_start_us;
+  return binary_file_write(recorder->fp, &header, sizeof(header), 1,
+                           "ToF binary header");
 }
 
 /*
@@ -107,6 +125,7 @@ int tof_recorder_open(tof_recorder_t *recorder, int capture_seconds)
   recorder->count = 0;
   recorder->total = 0;
   recorder->next_check_us = 0;
+  recorder->session_start_us = 0;
   recorder->failed = 0;
   recorder->started = 0;
 
@@ -132,12 +151,6 @@ int tof_recorder_open(tof_recorder_t *recorder, int capture_seconds)
 
   recorder->fp = binary_file_open(TOF_LOG_PATH);
   if (recorder->fp == NULL)
-    {
-      recorder->failed = 1;
-      return 1;
-    }
-
-  if (tof_recorder_write_header(recorder->fp))
     {
       recorder->failed = 1;
       return 1;
@@ -233,7 +246,7 @@ int tof_recorder_read_ready(tof_recorder_t *recorder)
 
   distance_mm = g_tof_sensor.read(false);
   sample = &recorder->buffer[recorder->count];
-  sample->timestamp_us = now_us;
+  sample->session_time_us = tof_recorder_session_time_us(recorder, now_us);
   sample->sample_index = recorder->total;
   sample->distance_mm = distance_mm;
   sample->range_status = (uint8_t)g_tof_sensor.ranging_data.range_status;
