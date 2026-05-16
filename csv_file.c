@@ -4,12 +4,17 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
+/*
+ * CSV ファイルを追記モードで開く。
+ * 新規作成または空ファイルの場合だけヘッダーを書き、既存ログには追記する。
+ */
 FILE *csv_file_open(const char *path, const char *header)
 {
   struct stat st;
   int need_header;
   FILE *fp;
 
+  /* stat() に失敗した場合は未作成とみなし、ヘッダーを書けるようにする。 */
   need_header = (stat(path, &st) != 0 || st.st_size == 0);
 
   fp = fopen(path, "a");

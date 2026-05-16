@@ -34,6 +34,10 @@
 #  define ADC_A5_RAW_MAX         SHRT_MAX
 #endif
 
+/*
+ * HPADC の int16_t 生値を拡張ボード A5 の電圧推定値へ変換する。
+ * ここでは Spresense Arduino core の HPADC1 マッピングに合わせた線形換算を使う。
+ */
 static float adc_a5_raw_to_voltage(int16_t raw)
 {
   int32_t clipped = raw;
@@ -51,6 +55,10 @@ static float adc_a5_raw_to_voltage(int16_t raw)
          (float)(ADC_A5_RAW_MAX - ADC_A5_RAW_MIN);
 }
 
+/*
+ * RAM に蓄積した ADC A5 サンプルを CSV に書き出す。
+ * sample_index はバッファ先頭の絶対サンプル番号から連番で付与する。
+ */
 static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
 {
   int16_t *p;
@@ -61,6 +69,7 @@ static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
       return 0;
     }
 
+  /* timestamp_sec は ADC のサンプル番号と 16kHz の固定レートから算出する。 */
   for (p = recorder->buffer; p < recorder->buffer + recorder->count; p++)
     {
       if (fprintf(recorder->fp, "%" PRIu32 ",%.9f,%" PRId16 ",%.6f\n",
@@ -89,6 +98,10 @@ static int adc_a5_recorder_flush(adc_a5_recorder_t *recorder)
   return 0;
 }
 
+/*
+ * ADC A5 recorder のデバイス、出力CSV、RAMバッファを準備する。
+ * 16kHz のサンプルを指定秒数分ためられる容量を優先し、足りなければ縮小する。
+ */
 int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
 {
   int target_samples;
@@ -110,6 +123,7 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
+  /* 収録中のSD書き込みを避けるため、まず収録全体分のRAM確保を試みる。 */
   target_samples = ADC_A5_RECORDER_SAMPLE_RATE_HZ * capture_seconds;
   for (recorder->capacity = target_samples;
        recorder->capacity >= 1;
@@ -139,6 +153,10 @@ int adc_a5_recorder_open(adc_a5_recorder_t *recorder, int capture_seconds)
   return recorder->fp == NULL ? 1 : 0;
 }
 
+/*
+ * HPADC1/A5 のサンプリング条件を設定して開始する。
+ * A5 は Spresense Arduino core 上で /dev/hpadc1 に対応する。
+ */
 int adc_a5_recorder_start(adc_a5_recorder_t *recorder)
 {
   int ret;
@@ -157,6 +175,10 @@ int adc_a5_recorder_start(adc_a5_recorder_t *recorder)
       return 1;
     }
 
+  /*
+   * 16kHz は SDK 設定値 CONFIG_CXD56_HPADC1_FREQ=7 を前提にする。
+   * ioctl が未対応の環境でも既定設定で動けるよう、ここでは警告に留める。
+   */
   ret = ioctl(recorder->fd, ANIOC_CXD56_FREQ, ADC_A5_FREQ_COEFFICIENT);
   if (ret < 0)
     {
@@ -185,6 +207,7 @@ int adc_a5_recorder_start(adc_a5_recorder_t *recorder)
   return 0;
 }
 
+/* ADC A5 のサンプリングを停止する。停止失敗は警告に留めて後始末を続ける。 */
 void adc_a5_recorder_stop(adc_a5_recorder_t *recorder)
 {
   if (recorder->fd >= 0 && ioctl(recorder->fd, ANIOC_CXD56_STOP, 0) < 0)
@@ -193,6 +216,10 @@ void adc_a5_recorder_stop(adc_a5_recorder_t *recorder)
     }
 }
 
+/*
+ * poll() で読み出し可能になった ADC サンプルをまとめて取り込む。
+ * ADC は 16kHz なので複数サンプルを一度に読み、RAMバッファへ詰める。
+ */
 int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
 {
   int i;
@@ -213,6 +240,7 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
       return -1;
     }
 
+  /* ドライバは int16_t の連続データを返すため、バイト数から件数へ変換する。 */
   samples_read = nbytes / sizeof(readbuf[0]);
   for (i = 0; i < samples_read; i++)
     {
@@ -229,6 +257,10 @@ int adc_a5_recorder_read_ready(adc_a5_recorder_t *recorder)
   return samples_read;
 }
 
+/*
+ * 残った ADC サンプルを書き出し、CSV、デバイス、RAMバッファを解放する。
+ * 戻り値は保存または後始末で失敗があったかどうかを示す。
+ */
 int adc_a5_recorder_finish(adc_a5_recorder_t *recorder)
 {
   if (!recorder->failed && recorder->fp != NULL && recorder->count > 0)

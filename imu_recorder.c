@@ -16,6 +16,10 @@
 #define IMU_GYRO_RANGE        125
 #define IMU_FIFO_THRESHOLD    1
 
+/*
+ * RAM に蓄積した IMU サンプルを CSV に書き出す。
+ * 収録中の SD 書き込みを極力減らすため、通常は終了処理でまとめて呼ばれる。
+ */
 static int imu_recorder_flush(imu_recorder_t *recorder)
 {
   cxd5602pwbimu_data_t *p;
@@ -25,6 +29,7 @@ static int imu_recorder_flush(imu_recorder_t *recorder)
       return 0;
     }
 
+  /* IMU timestamp は 19.2MHz カウンタなので、秒単位へ変換して保存する。 */
   for (p = recorder->buffer; p < recorder->buffer + recorder->count; p++)
     {
       if (fprintf(recorder->fp,
@@ -51,6 +56,10 @@ static int imu_recorder_flush(imu_recorder_t *recorder)
   return 0;
 }
 
+/*
+ * CXD5602PWBIMU のサンプリング条件を設定して計測を開始する。
+ * レート、レンジ、FIFOしきい値はこのファイル内の定数で固定する。
+ */
 static int imu_start_sensing(int fd)
 {
   cxd5602pwbimu_range_t range;
@@ -84,6 +93,10 @@ static int imu_start_sensing(int fd)
   return 0;
 }
 
+/*
+ * IMU recorder のデバイス、出力CSV、RAMバッファを準備する。
+ * バッファは指定秒数分を目標に確保し、足りない場合は半分ずつ下げて確保を試す。
+ */
 int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
 {
   int target_samples;
@@ -105,6 +118,7 @@ int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
       return 1;
     }
 
+  /* まず収録時間全体を保持できる容量を狙い、確保できなければ縮小する。 */
   target_samples = IMU_RECORDER_SAMPLE_RATE_HZ * capture_seconds;
   for (recorder->capacity = target_samples;
        recorder->capacity >= 1;
@@ -134,11 +148,13 @@ int imu_recorder_open(imu_recorder_t *recorder, int capture_seconds)
   return recorder->fp == NULL ? 1 : 0;
 }
 
+/* IMU のサンプリングを開始する。 */
 int imu_recorder_start(imu_recorder_t *recorder)
 {
   return imu_start_sensing(recorder->fd);
 }
 
+/* IMU のサンプリングを停止する。終了経路では失敗しても後始末を続ける。 */
 void imu_recorder_stop(imu_recorder_t *recorder)
 {
   if (recorder->fd >= 0)
@@ -147,6 +163,10 @@ void imu_recorder_stop(imu_recorder_t *recorder)
     }
 }
 
+/*
+ * poll() で読み出し可能になった IMU サンプルを 1 件取り込む。
+ * バッファが満杯の場合は CSV へ退避してから次のサンプルを格納する。
+ */
 int imu_recorder_read_ready(imu_recorder_t *recorder)
 {
   int ret;
@@ -169,6 +189,10 @@ int imu_recorder_read_ready(imu_recorder_t *recorder)
   return 1;
 }
 
+/*
+ * 残った IMU サンプルを書き出し、CSV、デバイス、RAMバッファを解放する。
+ * 戻り値は保存または後始末で失敗があったかどうかを示す。
+ */
 int imu_recorder_finish(imu_recorder_t *recorder)
 {
   if (!recorder->failed && recorder->fp != NULL && recorder->count > 0)

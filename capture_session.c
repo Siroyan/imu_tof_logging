@@ -12,6 +12,10 @@
 
 #define MAX_CAPTURE_SECONDS 10
 
+/*
+ * IMU と ADC A5 の両方を poll() で待つ。
+ * タイムアウトは異常終了にはせず、呼び出し元のループを継続させる。
+ */
 static int wait_capture_events(struct pollfd *fds)
 {
   int ret = poll(fds, 2, 1000);
@@ -28,6 +32,10 @@ static int wait_capture_events(struct pollfd *fds)
   return ret;
 }
 
+/*
+ * IMU バッファの使用率を一定間隔で表示する。
+ * ADC は高レートで取得するため、ここでは既存の進捗表示として IMU 側だけを見る。
+ */
 static void report_buffer_usage(imu_recorder_t *imu,
                                 struct timespec *now,
                                 struct timespec *prev)
@@ -45,6 +53,11 @@ static void report_buffer_usage(imu_recorder_t *imu,
     }
 }
 
+/*
+ * 収録セッション全体を管理する。
+ * センサー別の初期化やCSV保存は各 recorder に任せ、この関数は起動順、
+ * poll ループ、収録時間、終了処理だけを担当する。
+ */
 int capture_session_run(void)
 {
   int ret;
@@ -61,6 +74,7 @@ int capture_session_run(void)
   memset(&elapsed, 0, sizeof(elapsed));
   memset(&report_prev, 0, sizeof(report_prev));
 
+  /* 先に両 recorder のデバイス、CSV、RAMバッファを準備する。 */
   ret = imu_recorder_open(&imu, MAX_CAPTURE_SECONDS);
   if (ret)
     {
@@ -88,6 +102,10 @@ int capture_session_run(void)
   fds[1].fd = adc.fd;
   fds[1].events = POLLIN;
 
+  /*
+   * IMU を先に開始し、その直後に ADC を開始する。
+   * ADC の余分な先行サンプルを減らしつつ、両方を同じ poll ループで扱う。
+   */
   if (imu_recorder_start(&imu))
     {
       capture_failed = 1;
@@ -103,6 +121,7 @@ int capture_session_run(void)
 
   while (1)
     {
+      /* どちらかのデバイスに読み出し可能データが来るまで待つ。 */
       ret = wait_capture_events(fds);
       if (ret < 0)
         {
@@ -114,6 +133,10 @@ int capture_session_run(void)
           continue;
         }
 
+      /*
+       * ADC は 16kHz のため、読み出し可能になった時点で優先的に吸い上げる。
+       * CSV 書き込みは recorder 内で必要時のみ行う。
+       */
       if ((fds[1].revents & POLLIN) && adc_a5_recorder_read_ready(&adc) < 0)
         {
           capture_failed = 1;
@@ -122,6 +145,7 @@ int capture_session_run(void)
 
       if (fds[0].revents & POLLIN)
         {
+          /* 最初の IMU サンプルを収録開始時刻の基準にする。 */
           ret = imu_recorder_read_ready(&imu);
           if (ret < 0)
             {
@@ -139,6 +163,7 @@ int capture_session_run(void)
 
       if (started)
         {
+          /* 収録時間は CLOCK_MONOTONIC で測り、設定秒数に達したら終了する。 */
           clock_gettime(CLOCK_MONOTONIC, &now);
           clock_timespec_subtract(&now, &start, &elapsed);
 
@@ -154,10 +179,12 @@ int capture_session_run(void)
         }
     }
 
+  /* ループを抜けたら、まずサンプリングを止めてから残りのCSV保存に進む。 */
   adc_a5_recorder_stop(&adc);
   imu_recorder_stop(&imu);
 
 finish:
+  /* finish はファイル close とメモリ解放も兼ねるため、エラー経路でも必ず通す。 */
   capture_failed |= adc_a5_recorder_finish(&adc);
   capture_failed |= imu_recorder_finish(&imu);
 

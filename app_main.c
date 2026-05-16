@@ -35,6 +35,10 @@
 
 #include "capture_session.h"
 
+/*
+ * Arduino 側の setup() から呼ばれる C 側の入口。
+ * 実際の収録制御は capture_session_run() に集約する。
+ */
 int main(int argc, char *argv[])
 {
   (void)argc;
