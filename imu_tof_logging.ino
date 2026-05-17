@@ -8,13 +8,7 @@ SDClass SD;
 
 extern "C" int main(int argc, char *argv[]);
 
-#ifdef PIN_D02
-#  define RECORD_TRIGGER_PIN     PIN_D02
-#else
-#  define RECORD_TRIGGER_PIN     2
-#endif
-#define RECORD_TRIGGER_NAME      "Digital2"
-#define RECORD_TRIGGER_STABLE_MS 50
+#define RECORDING_AUTO_START_DELAY_MS 3000
 #define STATUS_LED_BLINK_MS      500
 
 static const uint8_t STATUS_LEDS[] = {LED0, LED1, LED2, LED3};
@@ -78,57 +72,30 @@ static void set_finished_leds(int result)
     }
 }
 
-static int is_trigger_level_stable(int level)
+/* 起動後の固定待機時間が終わるまで、待機中LEDを更新しながら待つ。 */
+static void wait_recording_start(unsigned long start_ms)
 {
-  if (digitalRead(RECORD_TRIGGER_PIN) != level)
-    {
-      return 0;
-    }
+  printf("Recording starts automatically after %lu ms from boot.\n",
+         (unsigned long)RECORDING_AUTO_START_DELAY_MS);
 
-  delay(RECORD_TRIGGER_STABLE_MS);
-  return digitalRead(RECORD_TRIGGER_PIN) == level;
-}
-
-/*
- * 拡張ボード Digital2 が LOW で待機してから HIGH になるまで待つ。
- * 拡張ボードのデジタル端子は未接続時に HIGH になり得るため、
- * 起動直後の HIGH はトリガとして扱わず、LOW確認後の立ち上がりだけを開始信号にする。
- */
-static void wait_recording_trigger(void)
-{
-  pinMode(RECORD_TRIGGER_PIN, INPUT);
-  printf("Waiting for %s LOW to arm recording trigger...\n",
-         RECORD_TRIGGER_NAME);
-
-  while (!is_trigger_level_stable(LOW))
+  while ((long)(millis() - start_ms) < 0)
     {
       update_waiting_leds();
       delay(10);
     }
 
-  printf("Recording trigger armed. Waiting for %s HIGH...\n",
-         RECORD_TRIGGER_NAME);
-
-  while (1)
-    {
-      update_waiting_leds();
-      if (is_trigger_level_stable(HIGH))
-        {
-          printf("Recording trigger detected.\n");
-          return;
-        }
-
-      delay(10);
-    }
+  printf("Auto recording start.\n");
 }
 
 void setup(void)
 {
   int ret;
   int main_result;
+  unsigned long recording_start_ms;
 
   initialize_status_leds();
   update_waiting_leds();
+  recording_start_ms = millis() + RECORDING_AUTO_START_DELAY_MS;
 
   ret = board_cxd5602pwbimu_initialize(5);
   if (ret < 0)
@@ -149,7 +116,7 @@ void setup(void)
       printf("SD.begin: OK\n");
     }
 
-  wait_recording_trigger();
+  wait_recording_start(recording_start_ms);
   set_recording_leds();
   main_result = main(0, NULL);
   set_finished_leds(main_result);
