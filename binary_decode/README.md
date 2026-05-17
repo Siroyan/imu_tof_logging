@@ -6,6 +6,18 @@
 python main.py
 ```
 
+ADC A5 の raw int16 を 16kHz/mono/16bit PCM WAV に変換する場合:
+
+```sh
+python main.py --adc-wav
+```
+
+CSV変換を省略してWAVだけ出力する場合:
+
+```sh
+python main.py --skip-csv --adc-wav
+```
+
 ## ADC A5 FFT
 
 `adc_a5_log.csv` の `voltage_v` 列から DC 成分を除去し、20msごとに

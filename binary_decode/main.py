@@ -1,5 +1,7 @@
+import argparse
 import csv
 import struct
+import wave
 from pathlib import Path
 
 
@@ -21,6 +23,29 @@ TOF_HEADER_V2_TAIL = struct.Struct("<IIIIIQ")
 TOF_RECORD = struct.Struct("<QIHBB")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Convert Spresense binary logs to CSV, and optionally WAV."
+    )
+    parser.add_argument(
+        "--adc-wav",
+        action="store_true",
+        help="Also convert adc_a5_log.bin to 16-bit mono WAV.",
+    )
+    parser.add_argument(
+        "--adc-wav-output",
+        default=SCRIPT_DIR / "adc_a5_log.wav",
+        type=Path,
+        help="ADC WAV output path. Defaults to binary_decode/adc_a5_log.wav.",
+    )
+    parser.add_argument(
+        "--skip-csv",
+        action="store_true",
+        help="Skip CSV conversion and run only explicitly requested outputs.",
+    )
+    return parser.parse_args()
+
+
 def read_exact(file_obj, size, label):
     data = file_obj.read(size)
     if len(data) != size:
@@ -30,6 +55,29 @@ def read_exact(file_obj, size, label):
 
 def magic_text(raw_magic):
     return raw_magic.rstrip(b"\0")
+
+
+def read_adc_header(file_obj):
+    magic, version = ADC_HEADER_PREFIX.unpack(
+        read_exact(file_obj, ADC_HEADER_PREFIX.size, "ADC header prefix")
+    )
+    if magic_text(magic) != b"ADCA5L1":
+        raise ValueError(f"unexpected ADC magic: {magic!r}")
+    if version >= 2:
+        (rate, record_size, _reserved0, session_start_us, ref_v,
+         raw_min, raw_max, _reserved1, _reserved2) = ADC_HEADER_V2_TAIL.unpack(
+            read_exact(file_obj, ADC_HEADER_V2_TAIL.size, "ADC v2 header")
+        )
+    else:
+        rate, record_size, ref_v, raw_min, raw_max = ADC_HEADER_V1_TAIL.unpack(
+            read_exact(file_obj, ADC_HEADER_V1_TAIL.size, "ADC v1 header")
+        )
+        session_start_us = None
+
+    if record_size != ADC_RECORD.size:
+        raise ValueError(f"unsupported ADC record size: {record_size}")
+
+    return rate, record_size, session_start_us, ref_v, raw_min, raw_max
 
 
 def convert_imu(bin_path, csv_path):
@@ -99,24 +147,9 @@ def convert_imu(bin_path, csv_path):
 
 def convert_adc(bin_path, csv_path):
     with open(bin_path, "rb") as f, open(csv_path, "w", newline="") as out:
-        magic, version = ADC_HEADER_PREFIX.unpack(
-            read_exact(f, ADC_HEADER_PREFIX.size, "ADC header prefix")
+        rate, record_size, session_start_us, ref_v, raw_min, raw_max = (
+            read_adc_header(f)
         )
-        if magic_text(magic) != b"ADCA5L1":
-            raise ValueError(f"unexpected ADC magic: {magic!r}")
-        if version >= 2:
-            (rate, record_size, _reserved0, session_start_us, ref_v,
-             raw_min, raw_max, _reserved1, _reserved2) = ADC_HEADER_V2_TAIL.unpack(
-                read_exact(f, ADC_HEADER_V2_TAIL.size, "ADC v2 header")
-            )
-        else:
-            rate, record_size, ref_v, raw_min, raw_max = ADC_HEADER_V1_TAIL.unpack(
-                read_exact(f, ADC_HEADER_V1_TAIL.size, "ADC v1 header")
-            )
-            session_start_us = None
-
-        if record_size != ADC_RECORD.size:
-            raise ValueError(f"unsupported ADC record size: {record_size}")
 
         writer = csv.writer(out)
         writer.writerow([
@@ -147,6 +180,27 @@ def convert_adc(bin_path, csv_path):
             voltage = (clipped - raw_min) * ref_v / (raw_max - raw_min)
             writer.writerow([index, session_time_us, monotonic_us, index / rate, raw, voltage])
             index += 1
+
+
+def convert_adc_wav(bin_path, wav_path):
+    with open(bin_path, "rb") as f, wave.open(str(wav_path), "wb") as out:
+        rate, record_size, _session_start_us, _ref_v, _raw_min, _raw_max = (
+            read_adc_header(f)
+        )
+
+        out.setnchannels(1)
+        out.setsampwidth(ADC_RECORD.size)
+        out.setframerate(rate)
+
+        while True:
+            data = f.read(record_size * 4096)
+            if len(data) == 0:
+                break
+            if len(data) % record_size != 0:
+                raise ValueError("truncated ADC record")
+
+            # ADC raw int16をそのまま16-bit PCM monoとして保存する。
+            out.writeframesraw(data)
 
 
 def convert_tof(bin_path, csv_path):
@@ -211,21 +265,31 @@ def convert_tof(bin_path, csv_path):
 
 
 def main():
+    args = parse_args()
     conversions = [
         (convert_imu, "imu_log.bin", "imu_log.csv"),
         (convert_adc, "adc_a5_log.bin", "adc_a5_log.csv"),
         (convert_tof, "tof_log.bin", "tof_log.csv"),
     ]
 
-    for convert, input_name, output_name in conversions:
-        input_path = SCRIPT_DIR / input_name
-        output_path = SCRIPT_DIR / output_name
+    if not args.skip_csv:
+        for convert, input_name, output_name in conversions:
+            input_path = SCRIPT_DIR / input_name
+            output_path = SCRIPT_DIR / output_name
+            if not input_path.exists():
+                print(f"skip: {input_path.name} not found")
+                continue
+
+            convert(input_path, output_path)
+            print(f"wrote: {output_path.name}")
+
+    if args.adc_wav:
+        input_path = SCRIPT_DIR / "adc_a5_log.bin"
         if not input_path.exists():
             print(f"skip: {input_path.name} not found")
-            continue
-
-        convert(input_path, output_path)
-        print(f"wrote: {output_path.name}")
+        else:
+            convert_adc_wav(input_path, args.adc_wav_output)
+            print(f"wrote: {args.adc_wav_output}")
 
 
 if __name__ == "__main__":
