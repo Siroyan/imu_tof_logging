@@ -72,6 +72,18 @@ def parse_args():
         help="Window step in milliseconds. Defaults to --window-ms.",
     )
     parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="FFT window width in samples. Overrides --window-ms.",
+    )
+    parser.add_argument(
+        "--hop",
+        type=int,
+        default=None,
+        help="Window step in samples. Overrides --hop-ms.",
+    )
+    parser.add_argument(
         "-x",
         "--exclude-freq",
         action="append",
@@ -203,16 +215,26 @@ def find_peak(signal, sample_rate, min_freq, max_freq, exclude_freqs,
     return peak_freq, peak_magnitude, freqs[1] - freqs[0]
 
 
-def window_samples(sample_rate, window_ms, hop_ms):
-    if window_ms <= 0:
-        raise ValueError("--window-ms must be positive")
-    if hop_ms is None:
-        hop_ms = window_ms
-    if hop_ms <= 0:
-        raise ValueError("--hop-ms must be positive")
+def window_samples(sample_rate, window_ms, hop_ms, window_samples_arg,
+                   hop_samples_arg):
+    if window_samples_arg is not None:
+        window_size = window_samples_arg
+    else:
+        if window_ms <= 0:
+            raise ValueError("--window-ms must be positive")
+        window_size = int(round(sample_rate * window_ms / 1000.0))
 
-    window_size = int(round(sample_rate * window_ms / 1000.0))
-    hop_size = int(round(sample_rate * hop_ms / 1000.0))
+    if hop_samples_arg is not None:
+        hop_size = hop_samples_arg
+    elif hop_ms is not None:
+        if hop_ms <= 0:
+            raise ValueError("--hop-ms must be positive")
+        hop_size = int(round(sample_rate * hop_ms / 1000.0))
+    elif window_samples_arg is not None:
+        hop_size = window_size
+    else:
+        hop_size = int(round(sample_rate * window_ms / 1000.0))
+
     if window_size < 4:
         raise ValueError("window is too short for FFT")
     if hop_size < 1:
@@ -288,6 +310,8 @@ def main():
         sample_rate,
         args.window_ms,
         args.hop_ms,
+        args.window,
+        args.hop,
     )
     rows, bin_width = analyze_windows(
         signal,
@@ -308,7 +332,9 @@ def main():
     print(f"samples: {len(signal)}")
     print(f"sample_rate_hz: {sample_rate:.6f} ({sample_rate_source})")
     print(f"window_ms: {window_size * 1000.0 / sample_rate:.6f}")
+    print(f"window_samples: {window_size}")
     print(f"hop_ms: {hop_size * 1000.0 / sample_rate:.6f}")
+    print(f"hop_samples: {hop_size}")
     print(f"windows: {len(rows)}")
     print(f"fft_bin_width_hz: {bin_width:.6f}")
     print(f"search_range_hz: {args.min_freq:.3f} - {args.max_freq:.3f}")

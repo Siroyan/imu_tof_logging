@@ -42,6 +42,7 @@ python fft.py path/to/adc_a5_log.csv
 python fft.py --column raw --max-freq 1000 --min-freq 1
 python fft.py --sample-rate 16000
 python fft.py --window-ms 20 --hop-ms 20
+python fft.py --window 320 --hop 160
 ```
 
 50Hz と 100Hz をピーク探索から除外する場合:
