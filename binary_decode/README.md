@@ -29,6 +29,8 @@ python fft.py
 
 結果は `adc_a5_fft_peaks.csv` に出力されます。各行は1つの20ms窓で、
 `center_sec` と `peak_frequency_hz` を見ればピーク周波数の時間変化を確認できます。
+同時に、横軸 `center_sec`、縦軸 `peak_frequency_hz` のPNG画像も同じ場所に保存されます。
+画像の表示範囲は横軸 0-10s、縦軸 0-200Hz です。
 
 任意のCSVを指定する場合:
 
@@ -44,6 +46,10 @@ python fft.py --sample-rate 16000
 python fft.py --window-ms 20 --hop-ms 20
 python fft.py --window 320 --hop 160
 ```
+
+PNG画像のファイル名は、入力ファイル名と実際のwindow/hopサンプル数から決まります。
+例えば `adc_a5_log.csv` を `--window 4096 --hop 32` で解析した場合は、
+`adc_a5_log_fft_peaks_window4096_hop32.png` が作成されます。
 
 50Hz と 100Hz をピーク探索から除外する場合:
 

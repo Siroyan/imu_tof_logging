@@ -17,6 +17,10 @@ DEFAULT_OUTPUT = SCRIPT_DIR / "adc_a5_fft_peaks.csv"
 DEFAULT_SAMPLE_RATE_HZ = 16000.0
 DEFAULT_MAX_FREQ_HZ = 1000.0
 DEFAULT_WINDOW_MS = 20.0
+PLOT_X_MIN_SEC = 0.0
+PLOT_X_MAX_SEC = 10.0
+PLOT_Y_MIN_HZ = 0.0
+PLOT_Y_MAX_HZ = 200.0
 
 
 def parse_args():
@@ -297,6 +301,46 @@ def write_peak_csv(output_path, rows):
             writer.writerow(row)
 
 
+def peak_plot_path(input_path, output_path, window_size, hop_size):
+    filename = (
+        f"{input_path.stem}_fft_peaks_window{window_size}_hop{hop_size}.png"
+    )
+    return output_path.parent / filename
+
+
+def write_peak_plot(input_path, output_path, rows, window_size, hop_size):
+    try:
+        import matplotlib
+
+        # GUIのない環境でもPNG保存できるよう、描画バックエンドを固定する。
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise SystemExit(
+            "matplotlib is required for PNG output. "
+            "Install dependencies with `uv sync` or `pip install matplotlib`."
+        ) from exc
+
+    plot_path = peak_plot_path(input_path, output_path, window_size, hop_size)
+    centers = [row["center_sec"] for row in rows]
+    peak_freqs = [row["peak_frequency_hz"] for row in rows]
+
+    fig, ax = plt.subplots(figsize=(10.0, 4.5), dpi=150)
+    ax.plot(centers, peak_freqs, linewidth=1.0)
+    ax.set_xlim(PLOT_X_MIN_SEC, PLOT_X_MAX_SEC)
+    ax.set_ylim(PLOT_Y_MIN_HZ, PLOT_Y_MAX_HZ)
+    ax.set_xlabel("center_sec [s]")
+    ax.set_ylabel("peak_frequency_hz [Hz]")
+    ax.set_title("ADC A5 FFT peak frequency")
+    ax.set_xticks(np.arange(PLOT_X_MIN_SEC, PLOT_X_MAX_SEC + 1.0, 1.0))
+    ax.set_yticks(np.arange(PLOT_Y_MIN_HZ, PLOT_Y_MAX_HZ + 20.0, 20.0))
+    ax.grid(True, linewidth=0.5, alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(plot_path)
+    plt.close(fig)
+    return plot_path
+
+
 def main():
     args = parse_args()
     signal, timestamps, session_times = read_adc_csv(args.csv_path, args.column)
@@ -324,10 +368,18 @@ def main():
         args.exclude_width,
     )
     write_peak_csv(args.output, rows)
+    plot_path = write_peak_plot(
+        args.csv_path,
+        args.output,
+        rows,
+        window_size,
+        hop_size,
+    )
     strongest = max(rows, key=lambda row: row["peak_magnitude"])
 
     print(f"input: {args.csv_path}")
     print(f"output: {args.output}")
+    print(f"plot: {plot_path}")
     print(f"column: {args.column}")
     print(f"samples: {len(signal)}")
     print(f"sample_rate_hz: {sample_rate:.6f} ({sample_rate_source})")

@@ -1,3 +1,4 @@
 *.bin
 *.csv
 *.wav
+*_fft_peaks_window*_hop*.png
